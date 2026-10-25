@@ -101,6 +101,41 @@ CLEANERS: tuple[CleanerSpec, ...] = (
             Target(f"{ANDROID_DATA}/*/lib/**", Capability.SYSTEM),
         ),
     ),
+
+    # -- database tier (bundled glibc sqlite3) ---------------------------
+    # DELETE only frees pages inside the file; VACUUM rewrites it so the bytes
+    # actually leave the disk. No Android tool can do this.
+    CleanerSpec(
+        name="own_databases",
+        description="Databáze této aplikace (VACUUM)",
+        requires=(Capability.APP_DATA,),
+        risk=Risk.LOW,
+        kind=Kind.SQLITE,
+        paths=(
+            Target(f"{APP_FILES}/*.db", Capability.APP_DATA),
+            Target(f"{APP_FILES}/databases/*.db", Capability.APP_DATA),
+        ),
+    ),
+    CleanerSpec(
+        name="other_databases",
+        description="Databáze ostatních aplikací (VACUUM)",
+        requires=(Capability.OTHER_APP_DATA,),
+        risk=Risk.MEDIUM,
+        kind=Kind.SQLITE,
+        paths=(
+            Target(f"{ANDROID_DATA}/*/databases/*.db", Capability.OTHER_APP_DATA),
+        ),
+    ),
+    CleanerSpec(
+        name="shared_databases",
+        description="Databáze ve sdíleném úložišti (VACUUM)",
+        requires=(Capability.SHARED_STORAGE,),
+        risk=Risk.LOW,
+        kind=Kind.SQLITE,
+        paths=(
+            Target(f"{SDCARD}/**/*.db", Capability.SHARED_STORAGE),
+        ),
+    ),
 )
 
 

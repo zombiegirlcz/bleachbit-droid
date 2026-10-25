@@ -85,12 +85,13 @@ def test_cleaner_metadata_complete(spec):
     assert spec.name and spec.description
     assert spec.requires, "cleaner must declare requires"
     assert isinstance(spec.risk, Risk)
-    if spec.kind is Kind.PATH:
-        assert spec.paths, "path cleaner must declare paths"
+    if spec.kind is Kind.PACKAGE:
+        assert not spec.paths, "package cleaner must not declare paths"
+    else:
+        # path and sqlite cleaners both reach targets through globs
+        assert spec.paths, f"{spec.kind.value} cleaner must declare paths"
         for target in spec.paths:
             assert target.pattern.startswith("/") or target.pattern.startswith("<")
-    else:
-        assert not spec.paths, "package cleaner should not declare paths"
 
 
 def test_cleaner_names_unique():
@@ -507,3 +508,132 @@ def test_as_list_variants():
     assert api._as_list("[a, b]") == ["a", "b"]
     assert api._as_list("a,b") == ["a", "b"]
     assert api._as_list(["a"]) == ["a"]
+
+# ---------------------------------------------------------------------------
+# sqlite cleaners (VACUUM through the injected runner)
+# ---------------------------------------------------------------------------
+
+def _sqlite_specs():
+    from bleachbit_droid.cleaners import all_cleaners
+    from bleachbit_droid.models import Kind
+
+    return [c for c in all_cleaners() if c.kind is Kind.SQLITE]
+
+
+def test_sqlite_cleaners_exist():
+    names = {c.name for c in _sqlite_specs()}
+    assert {"own_databases", "other_databases", "shared_databases"} <= names
+
+
+def test_nonroot_without_vacuum_runner_cannot_run_sqlite(roots):
+    backend = NonRootBackend([roots["app_files"]])
+    runnable = {s.name for s in engine.select_cleaners(backend)}
+    assert "own_databases" not in runnable
+    items = {i["name"]: i for i in engine.describe(backend)}
+    assert items["own_databases"]["enabled"] is False
+    assert "sqlite3" in items["own_databases"]["missing"]
+
+
+def test_nonroot_with_vacuum_runner_can_run_own_databases(roots):
+    backend = NonRootBackend([roots["app_files"]], vacuum_runner=lambda path: (0, "", ""))
+    runnable = {s.name for s in engine.select_cleaners(backend)}
+    assert "own_databases" in runnable
+    # other apps' databases still need a higher tier
+    assert "other_databases" not in runnable
+
+
+def test_scan_finds_databases(roots, tree: Path):
+    db = tree / "app.db"
+    db.write_bytes(b"SQLite format 3" + b"\0" * 100)
+
+    backend = NonRootBackend([str(tree)], vacuum_runner=lambda path: (0, "", ""))
+    report = engine.scan(backend, roots, ["own_databases"])
+
+    paths = {e.path for e in report.entries}
+    assert str(db) in paths
+    assert report.total_bytes == len(b"SQLite format 3" + b"\0" * 100)
+
+
+def test_scan_ignores_directories_named_db(roots, tree: Path):
+    (tree / "notadb.db").mkdir()
+
+    backend = NonRootBackend([str(tree)], vacuum_runner=lambda path: (0, "", ""))
+    report = engine.scan(backend, roots, ["own_databases"])
+    assert report.entries == []
+
+
+def test_apply_calls_vacuum_runner_not_delete(roots, tree: Path):
+    db = tree / "app.db"
+    db.write_bytes(b"x" * 500)
+    called = []
+
+    def vacuum(path):
+        called.append(path)
+        # Emulate VACUUM rewriting the file smaller.
+        open(path, "wb").write(b"y" * 100)
+        return (0, "", "")
+
+    backend = NonRootBackend([str(tree)], vacuum_runner=vacuum)
+    report = engine.apply(backend, roots, ["own_databases"], dry_run=False)
+
+    assert called == [str(db)]
+    assert db.exists(), "VACUUM must not delete the database"
+    assert report.freed_bytes == 400
+    assert report.failed == 0
+
+
+def test_apply_dry_run_does_not_vacuum(roots, tree: Path):
+    (tree / "app.db").write_bytes(b"x" * 500)
+    called = []
+
+    backend = NonRootBackend([str(tree)], vacuum_runner=lambda p: called.append(p) or (0, "", ""))
+    report = engine.apply(backend, roots, ["own_databases"], dry_run=True)
+
+    assert called == []
+    assert report.freed_bytes == 500
+    assert all(r.result.value == "dry_run" for r in report.log)
+
+
+def test_apply_reports_vacuum_failure(roots, tree: Path):
+    (tree / "app.db").write_bytes(b"x" * 500)
+
+    backend = NonRootBackend(
+        [str(tree)], vacuum_runner=lambda path: (1, "", "file is not a database")
+    )
+    report = engine.apply(backend, roots, ["own_databases"], dry_run=False)
+
+    assert report.failed == 1
+    assert report.freed_bytes == 0
+    assert any("not a database" in r.reason for r in report.log)
+
+
+def test_vacuum_grows_file_reports_zero_not_negative(roots, tree: Path):
+    db = tree / "app.db"
+    db.write_bytes(b"x" * 100)
+
+    def vacuum(path):
+        open(path, "wb").write(b"y" * 500)
+        return (0, "", "")
+
+    backend = NonRootBackend([str(tree)], vacuum_runner=vacuum)
+    report = engine.apply(backend, roots, ["own_databases"], dry_run=False)
+    assert report.freed_bytes == 0
+
+
+def test_api_registers_vacuum_runner(roots, tree: Path):
+    db = tree / "app.db"
+    db.write_bytes(b"x" * 400)
+    seen = []
+
+    api.set_vacuum_runner(lambda path: json.dumps(
+        {"code": 0 if seen.append(path) is None else 0, "stdout": "", "stderr": ""}
+    ))
+    try:
+        payload = json.dumps(
+            {"mode": "nonroot", "cleaners": ["own_databases"], "dry_run": False, **roots}
+        )
+        out = json.loads(api.apply_clean(payload))
+        assert "error" not in out, out
+        assert seen == [str(db)]
+    finally:
+        api._VACUUM_RUNNER = None

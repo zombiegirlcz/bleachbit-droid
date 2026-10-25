@@ -73,6 +73,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) {
             RootfsInstaller.ensure(context)
             GuestSelfTest.run(context)
+            // The Python core only learns about the guest toolchain here, so
+            // scan/apply can VACUUM databases on the non-root tier.
+            PythonBridge.registerVacuumRunner(VacuumRunner(context))
+            detectModes()
+            reload()
         }
 
         // Detect modes first so the UI is usable immediately. The root probe

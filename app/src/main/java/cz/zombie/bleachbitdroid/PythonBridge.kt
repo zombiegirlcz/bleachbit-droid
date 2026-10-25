@@ -57,6 +57,15 @@ object PythonBridge {
         mod.callAttr("set_root_runner", runner)
     }
 
+    /**
+     * Register the bundled-`sqlite3` VACUUM bridge with the Python side.
+     * Independent of the shell runners: the non-root tier has no shell.
+     */
+    fun registerVacuumRunner(runner: VacuumRunner) {
+        val mod = module ?: error("PythonBridge.init() not called")
+        mod.callAttr("set_vacuum_runner", runner)
+    }
+
     fun detect(context: Context, mode: String): JSONObject =
         call("detect", basePayload(context, mode).toString())
 

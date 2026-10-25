@@ -103,6 +103,8 @@ def select_cleaners(
             continue
         if spec.kind is Kind.PACKAGE and not backend.supports_packages:
             continue
+        if spec.kind is Kind.SQLITE and not backend.supports_sqlite:
+            continue
         result.append(spec)
     return result
 
@@ -114,6 +116,8 @@ def describe(backend: PrivilegeBackend) -> list[dict]:
         miss = missing(spec.requires, backend.capabilities)
         if spec.kind is Kind.PACKAGE and not backend.supports_packages:
             miss = miss + ["shell"] if "shell" not in miss else miss
+        if spec.kind is Kind.SQLITE and not backend.supports_sqlite:
+            miss = miss + ["sqlite3"] if "sqlite3" not in miss else miss
         item = spec.to_dict()
         item["enabled"] = not miss
         item["missing"] = list(miss)
@@ -159,6 +163,53 @@ def scan(
     seen: set[str] = set()
 
     for spec in select_cleaners(backend, names):
+        if spec.kind is Kind.SQLITE:
+            for target in spec.paths:
+                if not backend.can(target.requires):
+                    continue
+                try:
+                    pattern = expand_pattern(target.pattern, roots)
+                except KeyError as exc:
+                    report.log.append(
+                        LogRecord(
+                            backend=backend.name,
+                            cleaner=spec.name,
+                            path=target.pattern,
+                            action=Action.ERROR,
+                            result=Result.FAILED,
+                            reason=str(exc),
+                        )
+                    )
+                    continue
+                for match in _glob(pattern):
+                    if not backend.exists(match) or not os.path.isfile(match):
+                        continue
+                    if match in seen:
+                        continue
+                    seen.add(match)
+                    size = os.path.getsize(match)
+                    report.entries.append(
+                        Entry(
+                            cleaner=spec.name,
+                            path=match,
+                            size=size,
+                            is_dir=False,
+                            requires=target.requires,
+                        )
+                    )
+                    report.log.append(
+                        LogRecord(
+                            backend=backend.name,
+                            cleaner=spec.name,
+                            path=match,
+                            action=Action.SCAN,
+                            bytes=size,
+                            result=Result.OK,
+                            reason="database",
+                        )
+                    )
+            continue
+
         if spec.kind is Kind.PACKAGE:
             for pkg in _package_candidates(backend, spec, unused_packages):
                 key = f"package:{pkg}"
@@ -346,6 +397,8 @@ def apply(
         try:
             if entry.package:
                 stats = backend.clear_app_cache(entry.package)
+            elif entry.cleaner and by_name(entry.cleaner).kind is Kind.SQLITE:
+                stats = backend.vacuum_db(entry.path)
             else:
                 stats = backend.delete(entry.path)
         except (BackendError, OSError) as exc:

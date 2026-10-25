@@ -39,6 +39,9 @@ class PrivilegeBackend(ABC):
     capabilities: frozenset[Capability] = frozenset()
     #: package operations need a shell; path-only backends leave this False
     supports_packages: bool = False
+    #: database operations need the bundled glibc sqlite3; overridden as a
+    #: property by _SqliteMixin
+    supports_sqlite: bool = False
 
     # --- introspection -------------------------------------------------
     def can(self, cap: Capability) -> bool:
@@ -49,6 +52,7 @@ class PrivilegeBackend(ABC):
             "name": self.name,
             "capabilities": sorted(c.value for c in self.capabilities),
             "supports_packages": self.supports_packages,
+            "supports_sqlite": self.supports_sqlite,
         }
 
     # --- filesystem ----------------------------------------------------
@@ -76,6 +80,16 @@ class PrivilegeBackend(ABC):
     def installed_packages(self) -> list[str]:
         """Package names visible to this backend."""
         raise BackendError(f"backend {self.name!r} cannot list packages")
+
+    # --- databases -----------------------------------------------------
+    def vacuum_db(self, path: str) -> Stats:
+        """Rebuild a SQLite database so freed pages actually leave the file.
+
+        ``DELETE`` alone only moves pages onto the free list; the file keeps its
+        size and the data stays on disk. ``VACUUM`` rewrites it. Android ships no
+        tool that can do this, which is why the app bundles sqlite3.
+        """
+        raise BackendError(f"backend {self.name!r} cannot vacuum databases")
 
 
 # ---------------------------------------------------------------------------
@@ -176,17 +190,56 @@ class _ShellMixin:
         return sorted(packages)
 
 
+class _SqliteMixin:
+    """Database operations backed by a callback injected from Kotlin.
+
+    The callback is ``(path) -> (code, stdout, stderr)`` and is expected to run
+    the bundled glibc ``sqlite3``. Keeping it injected means the Python core
+    stays testable without Android and knows nothing about the loader.
+    """
+
+    @property
+    def supports_sqlite(self) -> bool:
+        """True only when a runner was actually injected.
+
+        A backend class that merely inherits the mixin cannot vacuum anything;
+        reporting True there would offer the cleaner in the UI and fail at
+        apply time.
+        """
+        try:
+            return self._vacuum_runner() is not None
+        except BackendError:
+            return False
+
+    def _vacuum_runner(self):
+        raise NotImplementedError
+
+    def vacuum_db(self, path: str) -> Stats:
+        before = os.path.getsize(path) if os.path.isfile(path) else 0
+        code, out, err = self._vacuum_runner()(path)
+        if code != 0:
+            raise BackendError(f"sqlite3 exit {code}: {err.strip() or out.strip()}")
+        after = os.path.getsize(path) if os.path.isfile(path) else 0
+        return Stats(files=1, bytes=max(before - after, 0))
+
+
 # ---------------------------------------------------------------------------
 # non-root: only our own app data + shared storage the process can reach
 # ---------------------------------------------------------------------------
 
-class NonRootBackend(PrivilegeBackend):
+class NonRootBackend(_SqliteMixin, PrivilegeBackend):
     name = "nonroot"
     capabilities = frozenset({Capability.APP_DATA, Capability.SHARED_STORAGE})
 
-    def __init__(self, allowed_roots: Iterable[str]) -> None:
+    def __init__(self, allowed_roots: Iterable[str], vacuum_runner=None) -> None:
         # Empty is allowed: introspection works, every guarded access is denied.
         self._roots = [os.path.realpath(r) for r in allowed_roots if r]
+        self._vacuum = vacuum_runner
+
+    def _vacuum_runner(self):
+        if self._vacuum is None:
+            raise BackendError("no sqlite3 runner registered")
+        return self._vacuum
 
     def _guard(self, path: str) -> str:
         real = os.path.realpath(path)
@@ -215,7 +268,7 @@ class NonRootBackend(PrivilegeBackend):
 # Shizuku / ADB: can reach other apps' data via `sh -c` run as shell (uid 2000)
 # ---------------------------------------------------------------------------
 
-class AdbBackend(_ShellMixin, PrivilegeBackend):
+class AdbBackend(_SqliteMixin, _ShellMixin, PrivilegeBackend):
     """Executes through a ``ShizukuRunner`` supplied by the Kotlin side.
 
     The runner interface is a single method ``run(command: str) -> (exit_code,
@@ -228,9 +281,15 @@ class AdbBackend(_ShellMixin, PrivilegeBackend):
         {Capability.APP_DATA, Capability.SHARED_STORAGE, Capability.OTHER_APP_DATA}
     )
 
-    def __init__(self, runner, app_files_dir: str = "") -> None:
+    def __init__(self, runner, app_files_dir: str = "", vacuum_runner=None) -> None:
         self._runner = runner
         self._app_files_dir = os.path.realpath(app_files_dir) if app_files_dir else ""
+        self._vacuum = vacuum_runner
+
+    def _vacuum_runner(self):
+        if self._vacuum is None:
+            raise BackendError("no sqlite3 runner registered")
+        return self._vacuum
 
     def _guarded(self, path: str) -> str:
         if not os.path.isabs(path) or ".." in path.split(os.sep):

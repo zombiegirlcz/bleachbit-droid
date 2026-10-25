@@ -71,6 +71,8 @@ def _backend(data: dict[str, Any]):
     mode = data.get("mode", "nonroot")
     roots = _roots(data)
 
+    vacuum = _vacuum_callable()
+
     if mode == "root":
         runner = _ROOT_RUNNER
         if runner is None:
@@ -80,10 +82,10 @@ def _backend(data: dict[str, Any]):
         runner = _ADB_RUNNER
         if runner is None:
             raise BackendError("adb backend requested but no runner registered")
-        return AdbBackend(runner, roots["app_files"])
+        return AdbBackend(runner, roots["app_files"], vacuum_runner=vacuum)
     if mode == "nonroot":
         allowed = [p for p in (roots["app_files"], roots["app_cache"], roots["external"]) if p]
-        return NonRootBackend(allowed)
+        return NonRootBackend(allowed, vacuum_runner=vacuum)
     raise BackendError(f"unknown mode {mode!r}")
 
 
@@ -109,6 +111,38 @@ class _ShellRunner:
 
 _ADB_RUNNER: _ShellRunner | None = None
 _ROOT_RUNNER: _ShellRunner | None = None
+_VACUUM_RUNNER: Callable[[str], Any] | None = None
+
+
+def _vacuum_callable():
+    """Adapt the Kotlin ``VACUUM`` runner to the callback the backends expect.
+
+    Kotlin hands us ``(path) -> json`` with ``{code, stdout, stderr}``; the
+    backends call ``runner(path) -> (code, stdout, stderr)``.
+    """
+    if _VACUUM_RUNNER is None:
+        return None
+
+    def run(path: str):
+        out = _VACUUM_RUNNER(path)
+        parsed = json.loads(out) if isinstance(out, str) else out
+        return (
+            int(parsed["code"]),
+            str(parsed.get("stdout", "")),
+            str(parsed.get("stderr", "")),
+        )
+
+    return run
+
+
+def set_vacuum_runner(fn: Callable[[str], Any]) -> None:
+    """Register the Kotlin ``sqlite3 VACUUM`` bridge.
+
+    Separate from the shell runners on purpose: on the non-root tier there is
+    no shell at all, the app just starts the bundled loader itself.
+    """
+    global _VACUUM_RUNNER
+    _VACUUM_RUNNER = fn
 
 
 def set_adb_runner(fn: Callable[[str], Any]) -> None:
@@ -238,4 +272,5 @@ __all__ = [
     "scan",
     "set_adb_runner",
     "set_root_runner",
+    "set_vacuum_runner",
 ]

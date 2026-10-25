@@ -46,6 +46,7 @@ class Kind(str, Enum):
 
     PATH = "path"        # filesystem globs, wiped through backend.delete()
     PACKAGE = "package"  # app packages, wiped through `pm clear --cache-only`
+    SQLITE = "sqlite"    # databases, reclaimed with VACUUM through the guest toolchain
 
 
 @dataclass(frozen=True)
