@@ -486,3 +486,24 @@ def test_api_scan_denies_cleaner_without_capability(roots):
     out = json.loads(api.scan(payload))
     assert out["entries"] == []
     assert out["total_bytes"] == 0
+
+
+def test_api_accepts_stringified_cleaner_list(roots, tree: Path):
+    """Kotlin's JSONObject.put(String, Object) stringifies a List, so the field
+    can arrive as "[app_cache, thumbnails]" instead of a JSON array. That used
+    to make Python iterate characters and fail with KeyError: '['."""
+    payload = json.dumps(
+        {"mode": "nonroot", "cleaners": "[app_cache, thumbnails]", **roots}
+    )
+    out = json.loads(api.scan(payload))
+    assert "error" not in out, out
+    assert out["total_bytes"] > 0
+
+
+def test_as_list_variants():
+    assert api._as_list(None) is None
+    assert api._as_list([]) == []
+    assert api._as_list("") == []
+    assert api._as_list("[a, b]") == ["a", "b"]
+    assert api._as_list("a,b") == ["a", "b"]
+    assert api._as_list(["a"]) == ["a"]

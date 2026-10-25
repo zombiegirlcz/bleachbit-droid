@@ -5,6 +5,7 @@ import android.util.Log
 import com.chaquo.python.PyObject
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -68,8 +69,8 @@ object PythonBridge {
         cleaners: List<String>,
         unusedPackages: List<String>? = null,
     ): JSONObject = call("scan", basePayload(context, mode).apply {
-        put("cleaners", cleaners)
-        if (unusedPackages != null) put("unused_packages", unusedPackages)
+        put("cleaners", JSONArray(cleaners))
+        if (unusedPackages != null) put("unused_packages", JSONArray(unusedPackages))
     }.toString())
 
     fun applyClean(
@@ -79,9 +80,9 @@ object PythonBridge {
         dryRun: Boolean,
         unusedPackages: List<String>? = null,
     ): JSONObject = call("apply_clean", basePayload(context, mode).apply {
-        put("cleaners", cleaners)
+        put("cleaners", JSONArray(cleaners))
         put("dry_run", dryRun)
-        if (unusedPackages != null) put("unused_packages", unusedPackages)
+        if (unusedPackages != null) put("unused_packages", JSONArray(unusedPackages))
     }.toString())
 
     private fun basePayload(context: Context, mode: String): JSONObject = JSONObject().apply {

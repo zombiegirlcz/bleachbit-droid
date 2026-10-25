@@ -32,6 +32,28 @@ def _safe(fn: Callable[[dict[str, Any]], Any]) -> Callable[[str], str]:
     return wrapper
 
 
+def _as_list(value):
+    """Coerce a JSON field into a list of strings.
+
+    Kotlin's JSONObject.put(String, Object) does not wrap collections, so an
+    older client sends the *string* "[app_cache, thumbnails]" instead of a
+    JSON array. Iterating that string yields characters and every lookup fails
+    with KeyError: '['. Accept both shapes.
+    """
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("[") and text.endswith("]"):
+            text = text[1:-1]
+        return [part.strip() for part in text.split(",") if part.strip()]
+    return [str(value)]
+
+
 def _roots(data: dict[str, Any]) -> dict[str, str]:
     """Build the placeholder -> path mapping from the Kotlin-supplied context."""
     return {
@@ -153,8 +175,8 @@ def scan(data: dict[str, Any]) -> dict[str, Any]:
     report = engine.scan(
         backend,
         _roots(data),
-        data.get("cleaners"),
-        data.get("unused_packages"),
+        _as_list(data.get("cleaners")),
+        _as_list(data.get("unused_packages")),
     )
     return report.to_dict()
 
@@ -165,9 +187,9 @@ def apply_clean(data: dict[str, Any]) -> dict[str, Any]:
     report = engine.apply(
         backend,
         _roots(data),
-        data.get("cleaners"),
+        _as_list(data.get("cleaners")),
         bool(data.get("dry_run", True)),
-        data.get("unused_packages"),
+        _as_list(data.get("unused_packages")),
     )
     return report.to_dict()
 
