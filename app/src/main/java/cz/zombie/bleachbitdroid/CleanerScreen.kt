@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -24,8 +25,8 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -56,12 +57,49 @@ fun CleanerScreen(viewModel: MainViewModel) {
 
     Scaffold(
         topBar = { TopAppBar(title = { Text("BleachBit Droid") }) },
+        bottomBar = {
+            // Buttons live in the bottom bar so they are always reachable,
+            // regardless of how long the cleaner list is.
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val ready = state.phase == Phase.IDLE && state.selectedCleaners.isNotEmpty()
+
+                OutlinedButton(
+                    onClick = { viewModel.scan() },
+                    enabled = ready,
+                    modifier = Modifier.weight(1f),
+                ) { Text("Prohledat") }
+
+                OutlinedButton(
+                    onClick = { viewModel.clean(dryRun = true) },
+                    enabled = ready,
+                    modifier = Modifier.weight(1f),
+                ) { Text("Zkusmo") }
+
+                Button(
+                    onClick = { viewModel.clean(dryRun = false) },
+                    enabled = ready,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    if (state.phase == Phase.CLEANING) {
+                        CircularProgressIndicator(modifier = Modifier.height(18.dp))
+                    } else {
+                        Text("Vyčistit")
+                    }
+                }
+            }
+        },
     ) { padding ->
         Column(
             modifier = Modifier
                 .padding(padding)
                 .padding(horizontal = 16.dp)
-                .fillMaxWidth(),
+                .fillMaxSize(),
         ) {
             Spacer(Modifier.height(8.dp))
 
@@ -88,103 +126,73 @@ fun CleanerScreen(viewModel: MainViewModel) {
             // Extra access that unlocks deeper cleaning even in non-root mode.
             if (!state.allFilesAccess && android.os.Build.VERSION.SDK_INT >= 30) {
                 TextButton(onClick = {
-                    val intent = Intent(
-                        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                        Uri.parse("package:" + context.packageName),
+                    context.startActivity(
+                        Intent(
+                            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                            Uri.parse("package:" + context.packageName),
+                        )
                     )
-                    context.startActivity(intent)
-                }) {
-                    Text("Povolit přístup ke všem souborům")
-                }
+                }) { Text("Povolit přístup ke všem souborům") }
             }
             if (!state.usageAccessGranted) {
                 TextButton(onClick = {
                     context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
-                }) {
-                    Text("Povolit přístup k využití aplikací")
-                }
+                }) { Text("Povolit přístup k využití aplikací") }
             }
 
             Spacer(Modifier.height(12.dp))
 
-            when (state.phase) {
-                Phase.LOADING -> CircularProgressIndicator()
-                else -> {
-                    state.scan?.let { scan ->
-                        Card(
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = CardDefaults.cardColors(
-                                containerColor = MaterialTheme.colorScheme.secondaryContainer,
-                            ),
-                        ) {
-                            Column(Modifier.padding(12.dp)) {
-                                Text(
-                                    "Nalezeno ${formatBytes(scan.totalBytes)} v ${scan.entries} položkách",
-                                    fontWeight = FontWeight.Bold,
-                                )
-                                if (scan.unknownSizeEntries > 0) {
-                                    Text(
-                                        "${scan.unknownSizeEntries} položek (cache aplikací) — velikost se ukáže po vyčištění",
-                                        style = MaterialTheme.typography.bodySmall,
-                                    )
-                                }
-                                scan.perCleaner.forEach { (name, bytes) ->
-                                    Text(
-                                        "$name: ${formatBytes(bytes)}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                    )
-                                }
-                            }
-                        }
-                        Spacer(Modifier.height(12.dp))
-                    }
+            if (state.phase == Phase.LOADING) {
+                CircularProgressIndicator()
+                return@Column
+            }
 
-                    state.message?.let {
-                        Text(it, color = MaterialTheme.colorScheme.primary)
-                        Spacer(Modifier.height(8.dp))
-                    }
-                    state.error?.let {
-                        Text("Chyba: $it", color = MaterialTheme.colorScheme.error)
-                        Spacer(Modifier.height(8.dp))
-                    }
-
-                    LazyColumn(modifier = Modifier.weight(1f)) {
-                        items(state.cleaners, key = { it.name }) { cleaner ->
-                            CleanerRow(
-                                cleaner = cleaner,
-                                checked = cleaner.name in state.selected,
-                                onToggle = { viewModel.toggleCleaner(cleaner.name) },
+            state.scan?.let { scan ->
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                    ),
+                ) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text(
+                            "Nalezeno ${formatBytes(scan.totalBytes)} v ${scan.entries} položkách",
+                            fontWeight = FontWeight.Bold,
+                        )
+                        if (scan.unknownSizeEntries > 0) {
+                            Text(
+                                "${scan.unknownSizeEntries} položek (cache aplikací) — velikost se ukáže po vyčištění",
+                                style = MaterialTheme.typography.bodySmall,
                             )
-                            HorizontalDivider()
+                        }
+                        scan.perCleaner.forEach { (name, bytes) ->
+                            Text(
+                                "$name: ${formatBytes(bytes)}",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
                         }
                     }
+                }
+                Spacer(Modifier.height(12.dp))
+            }
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        OutlinedButton(
-                            onClick = { viewModel.scan() },
-                            enabled = state.phase == Phase.IDLE && state.selectedCleaners.isNotEmpty(),
-                        ) { Text("Prohledat") }
+            state.message?.let {
+                Text(it, color = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.height(8.dp))
+            }
+            state.error?.let {
+                Text("Chyba: $it", color = MaterialTheme.colorScheme.error)
+                Spacer(Modifier.height(8.dp))
+            }
 
-                        OutlinedButton(
-                            onClick = { viewModel.clean(dryRun = true) },
-                            enabled = state.phase == Phase.IDLE && state.selectedCleaners.isNotEmpty(),
-                        ) { Text("Zkusmo") }
-
-                        Button(
-                            onClick = { viewModel.clean(dryRun = false) },
-                            enabled = state.phase == Phase.IDLE && state.selectedCleaners.isNotEmpty(),
-                        ) {
-                            if (state.phase == Phase.CLEANING) {
-                                CircularProgressIndicator(modifier = Modifier.height(18.dp))
-                            } else {
-                                Text("Vyčistit")
-                            }
-                        }
-                    }
+            LazyColumn(modifier = Modifier.weight(1f)) {
+                items(state.cleaners, key = { it.name }) { cleaner ->
+                    CleanerRow(
+                        cleaner = cleaner,
+                        checked = cleaner.name in state.selected,
+                        onToggle = { viewModel.toggleCleaner(cleaner.name) },
+                    )
+                    HorizontalDivider()
                 }
             }
         }

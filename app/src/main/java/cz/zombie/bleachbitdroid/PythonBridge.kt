@@ -1,6 +1,7 @@
 package cz.zombie.bleachbitdroid
 
 import android.content.Context
+import android.util.Log
 import com.chaquo.python.PyObject
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
@@ -28,8 +29,14 @@ object PythonBridge {
     private fun call(name: String, payload: String): JSONObject {
         val mod = module ?: error("PythonBridge.init() not called")
         val raw = mod.callAttr(name, payload).toString()
+        // Full payload goes to logcat: the UI only shows `error`, but the
+        // Python side also returns a `traceback` field we need for debugging.
+        Log.d(TAG, "$name <- $payload")
+        Log.d(TAG, "$name -> $raw")
         return JSONObject(raw)
     }
+
+    private const val TAG = "PythonBridge"
 
     /**
      * Register the Shizuku-backed shell runner with the Python side.

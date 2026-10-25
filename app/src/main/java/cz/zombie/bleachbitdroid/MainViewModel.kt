@@ -59,13 +59,25 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Re-read runtime permissions and re-register the Shizuku runner.
+     *
+     * Shizuku access can be granted while the app is in the background (via
+     * `nh shizuku grant` or the Shizuku app), so `onResume` must not only
+     * refresh the flags but also re-register the runner and re-detect modes.
+     */
     fun refreshPermissions() {
+        val shizukuGranted = ShizukuRunner.hasPermission()
+        if (shizukuGranted) {
+            PythonBridge.registerAdbRunner(ShizukuRunner())
+        }
         _state.update {
             it.copy(
                 usageAccessGranted = UsageStatsProvider.hasPermission(context),
                 allFilesAccess = hasAllFilesAccess(),
             )
         }
+        detectModes()
     }
 
     fun hasAllFilesAccess(): Boolean =

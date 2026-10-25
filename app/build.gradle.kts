@@ -52,8 +52,8 @@ android {
 }
 
 chaquopy {
-    version = "3.13"
     defaultConfig {
+        version = "3.13"
         buildPython("python3")
         pip {
             // no third-party runtime deps needed yet
