@@ -63,6 +63,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         ShizukuRunner.onBinderChanged = { refreshPermissions() }
         ShizukuRunner.startListeners()
 
+        // Detect modes first so the UI is usable immediately. The root probe
+        // spawns `su`, which blocks on a Magisk prompt until the user answers.
+        detectModes()
         refreshPermissions()
         reload()
     }
@@ -79,6 +82,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 if (shizuku) {
                     PythonBridge.registerAdbRunner(ShizukuRunner())
                 }
+                // Bounded probe: a pending Magisk prompt must not stall startup.
                 val root = RootRunner.isAvailable()
                 if (root) {
                     PythonBridge.registerRootRunner(RootRunner())
