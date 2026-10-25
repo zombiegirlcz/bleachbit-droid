@@ -21,6 +21,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -42,6 +43,7 @@ private fun riskLabel(risk: String): String = when (risk) {
     else -> risk
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CleanerScreen(viewModel: MainViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()

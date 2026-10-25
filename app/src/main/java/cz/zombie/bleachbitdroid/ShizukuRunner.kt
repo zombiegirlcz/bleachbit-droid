@@ -11,13 +11,17 @@ import rikka.shizuku.Shizuku
  * Shizuku runs the command with ADB-level privileges, which is exactly the
  * "ADB (Shizuku)" tier from AGENTS.md: more than the app's own uid, less than
  * root.
+ *
+ * `Shizuku.newProcess` is not part of the public Kotlin surface in API 13.x
+ * (it is hidden with @RestrictTo), so we call it reflectively. If Shizuku ever
+ * changes that method away, this is the single place to fix.
  */
 class ShizukuRunner : ShellRunner {
 
     override fun run(command: String): String {
         val result = JSONObject()
         return try {
-            val process = Shizuku.newProcess(arrayOf("sh", "-c", command), null, null)
+            val process = newProcess(arrayOf("sh", "-c", command))
             val stdout = process.inputStream.bufferedReader().use { it.readText() }
             val stderr = process.errorStream.bufferedReader().use { it.readText() }
             val code = process.waitFor()
@@ -32,6 +36,17 @@ class ShizukuRunner : ShellRunner {
             result.put("stderr", t.message ?: t.javaClass.simpleName)
             result.toString()
         }
+    }
+
+    private fun newProcess(cmd: Array<String>): Process {
+        val method = Shizuku::class.java.getDeclaredMethod(
+            "newProcess",
+            Array<String>::class.java,
+            Array<String>::class.java,
+            String::class.java,
+        )
+        method.isAccessible = true
+        return method.invoke(null, cmd, null, null) as Process
     }
 
     companion object {

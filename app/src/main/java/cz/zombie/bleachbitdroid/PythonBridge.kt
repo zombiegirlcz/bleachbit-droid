@@ -41,15 +41,15 @@ object PythonBridge {
     }
 
     fun detect(context: Context, mode: String): JSONObject =
-        call("detect", basePayload(context, mode))
+        call("detect", basePayload(context, mode).toString())
 
     fun listCleaners(context: Context, mode: String): JSONObject =
-        call("list_cleaners", basePayload(context, mode))
+        call("list_cleaners", basePayload(context, mode).toString())
 
     fun scan(context: Context, mode: String, cleaners: List<String>): JSONObject =
         call("scan", basePayload(context, mode).apply {
             put("cleaners", cleaners)
-        })
+        }.toString())
 
     fun applyClean(
         context: Context,
@@ -59,7 +59,7 @@ object PythonBridge {
     ): JSONObject = call("apply_clean", basePayload(context, mode).apply {
         put("cleaners", cleaners)
         put("dry_run", dryRun)
-    })
+    }.toString())
 
     private fun basePayload(context: Context, mode: String): JSONObject = JSONObject().apply {
         put("mode", mode)
