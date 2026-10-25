@@ -4,32 +4,42 @@ import android.content.pm.PackageManager
 import android.util.Log
 import org.json.JSONObject
 import rikka.shizuku.Shizuku
+import java.io.InputStream
+import java.util.concurrent.TimeUnit
 
 /**
- * Executes shell commands as the `shell` user (uid 2000) through Shizuku.
- *
- * Shizuku runs the command with ADB-level privileges, which is exactly the
- * "ADB (Shizuku)" tier from AGENTS.md: more than the app's own uid, less than
- * root.
- *
- * `Shizuku.newProcess` is not part of the public Kotlin surface in API 13.x
- * (it is hidden with @RestrictTo), so we call it reflectively. If Shizuku ever
- * changes that method away, this is the single place to fix.
- */
+Describe the purpose of the class.
+*/
 class ShizukuRunner : ShellRunner {
 
     override fun run(command: String): String {
         val result = JSONObject()
+        var process: Process? = null
         return try {
-            val process = newProcess(arrayOf("sh", "-c", command))
-            val stdout = process.inputStream.bufferedReader().use { it.readText() }
-            val stderr = process.errorStream.bufferedReader().use { it.readText() }
-            val code = process.waitFor()
-            result.put("code", code)
-            result.put("stdout", stdout)
-            result.put("stderr", stderr)
+            process = newProcess(arrayOf("sh", "-c", command))
+            val stdout = StringBuilder()
+            val stderr = StringBuilder()
+            val outThread = drain(process.inputStream, stdout)
+            val errThread = drain(process.errorStream, stderr)
+            val finished = process.waitFor(TIMEOUT_SEC, TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                outThread.join(1000)
+                errThread.join(1000)
+                Log.w(TAG, +shizuku exec timed out: $command")
+                result.put("code", -1)
+                result.put("stdout", stdout.toString())
+                result.put("stderr", "timeout")
+                return result.toString()
+            }
+            outThread.join(2000)
+            errThread.join(2000)
+            result.put("code", process.exitValue())
+            result.put("stdout", stdout.toString())
+            result.put("stderr", stderr.toString())
             result.toString()
         } catch (t: Throwable) {
+            process?.destroyForcibly()
             Log.w(TAG, "shizuku exec failed: $command", t)
             result.put("code", -1)
             result.put("stdout", "")
@@ -53,6 +63,29 @@ class ShizukuRunner : ShellRunner {
         private const val TAG = "ShizukuRunner"
         const val REQUEST_CODE = 421
 
+        /** Upper bound for one shell command. */
+        private const val TIMEOUT_SEC = 60L
+
+        private fun drain(stream: InputStream, sink: StringBuilder): Thread {
+            val t = Thread {
+                try {
+                    stream.bufferedReader().use { reader ->
+                        val buf = CharArray(4096)
+                        while (true) {
+                            val n = reader.read(buf)
+                            if (n < 0) break
+                            synchronized(sink) { sink.append(buf, 0, n) }
+                        }
+                    }
+                } catch (_: Throwable) {
+                    // process died or stream closed
+                }
+            }
+            t.isDaemon = true
+            t.start()
+            return t
+        }
+
         private val binderReceived = Shizuku.OnBinderReceivedListener {
             Log.i(TAG, "shizuku binder received")
             onBinderChanged?.invoke()
@@ -63,20 +96,15 @@ class ShizukuRunner : ShellRunner {
         }
         private val permissionResult = Shizuku.OnRequestPermissionResultListener { code, grant ->
             if (code == REQUEST_CODE) {
-                Log.i(TAG, "shizuku permission result: $grant")
+                Log.i(TAG,
+                        "shizuku permission result: $grant")
                 onBinderChanged?.invoke()
             }
         }
 
-        /**
-         * Called whenever the Shizuku binder appears/disappears or the grant
-         * changes. The binder is delivered *after* the activity starts, so a
-         * one-shot check at startup would miss it.
-         */
         @Volatile
         var onBinderChanged: (() -> Unit)? = null
 
-        /** Register listeners; safe to call more than once. */
         fun startListeners() {
             try {
                 Shizuku.addBinderReceivedListenerSticky(binderReceived)
@@ -87,14 +115,12 @@ class ShizukuRunner : ShellRunner {
             }
         }
 
-        /** True when the Shizuku service is running and reachable. */
         fun isAvailable(): Boolean = try {
             Shizuku.pingBinder()
         } catch (t: Throwable) {
             false
         }
 
-        /** True when we already hold the Shizuku permission. */
         fun hasPermission(): Boolean = try {
             isAvailable() &&
                 !Shizuku.isPreV11() &&
@@ -103,7 +129,6 @@ class ShizukuRunner : ShellRunner {
             false
         }
 
-        /** Ask the user to grant Shizuku access; result arrives in the listener. */
         fun requestPermission() {
             if (!isAvailable()) return
             try {
@@ -111,7 +136,8 @@ class ShizukuRunner : ShellRunner {
                     Shizuku.requestPermission(REQUEST_CODE)
                 }
             } catch (t: Throwable) {
-                Log.w(TAG, "shizuku permission request failed", t)
+                Log.w(TAG,
+                        "shizuku permission request failed", t)
             }
         }
     }
