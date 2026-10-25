@@ -26,7 +26,7 @@ class ShizukuRunner : ShellRunner {
                 process.destroyForcibly()
                 outThread.join(1000)
                 errThread.join(1000)
-                Log.w(TAG, +shizuku exec timed out: $command")
+                Log.w(TAG, "shizuku exec timed out: $command")
                 result.put("code", -1)
                 result.put("stdout", stdout.toString())
                 result.put("stderr", "timeout")
