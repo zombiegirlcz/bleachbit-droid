@@ -637,3 +637,33 @@ def test_api_registers_vacuum_runner(roots, tree: Path):
         assert seen == [str(db)]
     finally:
         api._VACUUM_RUNNER = None
+
+
+def test_api_accepts_object_runner_with_run_method(roots, tree: Path):
+    """Chaquopy hands Python a Java object that is not `callable()`.
+
+    Regression: `_vacuum_callable()` used to call the proxy directly, which
+    raised `TypeError: VacuumRunner is not callable` on device.
+    """
+    db = tree / "app.db"
+    db.write_bytes(b"x" * 400)
+    seen = []
+
+    class JavaStyleRunner:
+        """Mimics a Chaquopy proxy: a method, no __call__."""
+
+        def run(self, path):
+            seen.append(path)
+            return json.dumps({"code": 0, "stdout": "", "stderr": ""})
+
+    api.set_vacuum_runner(JavaStyleRunner())
+    try:
+        assert not callable(api._VACUUM_RUNNER)
+        payload = json.dumps(
+            {"mode": "nonroot", "cleaners": ["own_databases"], "dry_run": False, **roots}
+        )
+        out = json.loads(api.apply_clean(payload))
+        assert "error" not in out, out
+        assert seen == [str(db)]
+    finally:
+        api._VACUUM_RUNNER = None

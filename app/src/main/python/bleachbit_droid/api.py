@@ -119,12 +119,19 @@ def _vacuum_callable():
 
     Kotlin hands us ``(path) -> json`` with ``{code, stdout, stderr}``; the
     backends call ``runner(path) -> (code, stdout, stderr)``.
+
+    Chaquopy passes a Java object as a proxy that is *not* ``callable()``, it
+    only exposes the methods of the class. So accept either a plain Python
+    callable (tests) or an object with a ``run(path)`` method (``VacuumRunner``).
     """
     if _VACUUM_RUNNER is None:
         return None
 
+    target = _VACUUM_RUNNER
+    invoke = target if callable(target) else target.run
+
     def run(path: str):
-        out = _VACUUM_RUNNER(path)
+        out = invoke(path)
         parsed = json.loads(out) if isinstance(out, str) else out
         return (
             int(parsed["code"]),
