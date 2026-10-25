@@ -19,17 +19,21 @@ data class CleanerItem(
     val requires: List<String>,
     val enabled: Boolean,
     val missing: List<String>,
+    val kind: String,
+    val unusedDays: Int,
 )
 
 data class BackendInfo(
     val name: String,
     val capabilities: List<String>,
+    val supportsPackages: Boolean,
 )
 
 data class ScanSummary(
     val totalBytes: Long,
     val entries: Int,
     val perCleaner: Map<String, Long>,
+    val unknownSizeEntries: Int,
     val raw: JSONObject,
 )
 
@@ -55,6 +59,7 @@ object CleanerRepository {
         val info = BackendInfo(
             name = backend.getString("name"),
             capabilities = backend.getJSONArray("capabilities").toStringList(),
+            supportsPackages = backend.optBoolean("supports_packages", false),
         )
 
         val cleaners = mutableListOf<CleanerItem>()
@@ -68,6 +73,8 @@ object CleanerRepository {
                 requires = o.getJSONArray("requires").toStringList(),
                 enabled = o.getBoolean("enabled"),
                 missing = o.getJSONArray("missing").toStringList(),
+                kind = o.optString("kind", "path"),
+                unusedDays = o.optInt("unused_days", 0),
             )
         }
         info to cleaners
@@ -77,8 +84,9 @@ object CleanerRepository {
         context: Context,
         mode: PrivilegeMode,
         cleaners: List<String>,
+        unusedPackages: List<String>? = null,
     ): ScanSummary = withContext(Dispatchers.Default) {
-        val json = PythonBridge.scan(context, mode.id, cleaners)
+        val json = PythonBridge.scan(context, mode.id, cleaners, unusedPackages)
         json.optString("error").takeIf { it.isNotEmpty() }?.let { error(it) }
 
         val perCleaner = mutableMapOf<String, Long>()
@@ -92,6 +100,7 @@ object CleanerRepository {
             totalBytes = json.getLong("total_bytes"),
             entries = entries.length(),
             perCleaner = perCleaner,
+            unknownSizeEntries = json.optInt("unknown_size_entries", 0),
             raw = json,
         )
     }
@@ -101,8 +110,9 @@ object CleanerRepository {
         mode: PrivilegeMode,
         cleaners: List<String>,
         dryRun: Boolean,
+        unusedPackages: List<String>? = null,
     ): CleanSummary = withContext(Dispatchers.Default) {
-        val json = PythonBridge.applyClean(context, mode.id, cleaners, dryRun)
+        val json = PythonBridge.applyClean(context, mode.id, cleaners, dryRun, unusedPackages)
         json.optString("error").takeIf { it.isNotEmpty() }?.let { error(it) }
 
         val lines = mutableListOf<String>()

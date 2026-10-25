@@ -1,17 +1,16 @@
 """Regression tests for the Python core.
 
-Run from ``app/src/main/python``'s parent, i.e.:
+Run from the ``app`` directory:
 
-    cd app && python3 -m pytest src/test/python -q
+    python3 -m pytest src/test/python -q
 
 All deletion tests use throwaway fixture trees, never real system data
-(AGENTS.md §7).
+(AGENTS.md §7). Package operations use fake shell runners.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -26,11 +25,13 @@ from bleachbit_droid.backends import (  # noqa: E402
     AdbBackend,
     BackendError,
     NonRootBackend,
+    RootBackend,
+    _validate_package,
     shell_quote,
 )
 from bleachbit_droid.capabilities import missing  # noqa: E402
 from bleachbit_droid.cleaners import all_cleaners, by_name  # noqa: E402
-from bleachbit_droid.models import Capability, Risk  # noqa: E402
+from bleachbit_droid.models import Capability, Kind, Risk  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +61,21 @@ def roots(tree: Path) -> dict[str, str]:
     }
 
 
+class FakeShell:
+    """Records commands and answers like a shell would."""
+
+    def __init__(self, replies: dict[str, tuple[int, str, str]] | None = None) -> None:
+        self.calls: list[str] = []
+        self.replies = replies or {}
+
+    def run(self, command: str) -> tuple[int, str, str]:
+        self.calls.append(command)
+        for prefix, reply in self.replies.items():
+            if command.startswith(prefix):
+                return reply
+        return 0, "", ""
+
+
 # ---------------------------------------------------------------------------
 # cleaner metadata (AGENTS.md §8)
 # ---------------------------------------------------------------------------
@@ -68,10 +84,13 @@ def roots(tree: Path) -> dict[str, str]:
 def test_cleaner_metadata_complete(spec):
     assert spec.name and spec.description
     assert spec.requires, "cleaner must declare requires"
-    assert spec.paths, "cleaner must declare paths"
     assert isinstance(spec.risk, Risk)
-    for target in spec.paths:
-        assert target.pattern.startswith("/") or target.pattern.startswith("<")
+    if spec.kind is Kind.PATH:
+        assert spec.paths, "path cleaner must declare paths"
+        for target in spec.paths:
+            assert target.pattern.startswith("/") or target.pattern.startswith("<")
+    else:
+        assert not spec.paths, "package cleaner should not declare paths"
 
 
 def test_cleaner_names_unique():
@@ -97,6 +116,18 @@ def test_cleaner_requires_nonempty():
         )
 
 
+def test_path_cleaner_needs_paths():
+    from bleachbit_droid.models import CleanerSpec
+
+    with pytest.raises(ValueError):
+        CleanerSpec(
+            name="bad",
+            description="x",
+            requires=(Capability.APP_DATA,),
+            risk=Risk.LOW,
+        )
+
+
 # ---------------------------------------------------------------------------
 # capability gating
 # ---------------------------------------------------------------------------
@@ -107,12 +138,15 @@ def test_missing_capabilities():
     assert missing((Capability.APP_DATA, Capability.SYSTEM), have) == [Capability.SYSTEM]
 
 
-def test_nonroot_cannot_run_system_cleaners(roots):
+def test_nonroot_cannot_run_privileged_cleaners(roots):
     backend = NonRootBackend([roots["app_files"]])
     runnable = {s.name for s in engine.select_cleaners(backend)}
     assert "app_cache" in runnable
     assert "logcat_dumps" not in runnable
     assert "apk_leftovers" not in runnable
+    # package cleaners need a shell
+    assert "other_app_cache" not in runnable
+    assert "unused_app_cache" not in runnable
 
 
 def test_describe_marks_missing(roots):
@@ -121,6 +155,16 @@ def test_describe_marks_missing(roots):
     assert items["app_cache"]["enabled"] is True
     assert items["logcat_dumps"]["enabled"] is False
     assert "system" in items["logcat_dumps"]["missing"]
+    assert items["other_app_cache"]["enabled"] is False
+    assert "shell" in items["other_app_cache"]["missing"]
+
+
+def test_adb_can_run_package_cleaners(roots):
+    backend = AdbBackend(FakeShell(), roots["app_files"])
+    runnable = {s.name for s in engine.select_cleaners(backend)}
+    assert "other_app_cache" in runnable
+    assert "unused_app_cache" in runnable
+    assert "logcat_dumps" not in runnable
 
 
 # ---------------------------------------------------------------------------
@@ -147,17 +191,35 @@ def test_nonroot_empty_roots_denies_everything(tree: Path):
         backend.measure(str(tree))
 
 
+def test_nonroot_cannot_clear_packages(tree: Path):
+    backend = NonRootBackend([str(tree)])
+    with pytest.raises(BackendError):
+        backend.clear_app_cache("com.example")
+    with pytest.raises(BackendError):
+        backend.installed_packages()
+
+
 def test_shell_quote():
     assert shell_quote("a b") == "'a b'"
     assert shell_quote("it's") == "'it'\\''s'"
 
 
-def test_adb_backend_rejects_relative_and_traversal(tmp_path: Path):
-    class FakeRunner:
-        def run(self, command):
-            return 0, "", ""
+@pytest.mark.parametrize(
+    "bad",
+    ["", "with space", "-rm", "a/b", "a;rm -rf /", "$(id)", "x`id`"],
+)
+def test_validate_package_rejects_injection(bad):
+    with pytest.raises(BackendError):
+        _validate_package(bad)
 
-    backend = AdbBackend(FakeRunner(), str(tmp_path))
+
+def test_validate_package_accepts_normal_names():
+    assert _validate_package("com.example.app") == "com.example.app"
+    assert _validate_package("a_b.c") == "a_b.c"
+
+
+def test_adb_backend_rejects_relative_and_traversal(tmp_path: Path):
+    backend = AdbBackend(FakeShell(), str(tmp_path))
     with pytest.raises(BackendError):
         backend._guarded("relative/path")
     with pytest.raises(BackendError):
@@ -166,19 +228,78 @@ def test_adb_backend_rejects_relative_and_traversal(tmp_path: Path):
 
 
 def test_adb_backend_uses_runner():
-    calls = []
-
-    class FakeRunner:
-        def run(self, command):
-            calls.append(command)
-            if command.startswith("du"):
-                return 0, "4096\t/x\n", ""
-            return 0, "", ""
-
-    backend = AdbBackend(FakeRunner(), "/app")
+    shell = FakeShell({"du": (0, "4096\t/x\n", "")})
+    backend = AdbBackend(shell, "/app")
     stats = backend.delete("/data/local/tmp/x")
     assert stats.bytes == 4096
-    assert any(c.startswith("rm -rf") for c in calls)
+    assert any(c.startswith("rm -rf") for c in shell.calls)
+
+
+# ---------------------------------------------------------------------------
+# package operations (ADB / root)
+# ---------------------------------------------------------------------------
+
+def test_adb_clear_app_cache_runs_pm_and_force_stop():
+    shell = FakeShell({"du": (0, "16\t/x\n", "")})
+    backend = AdbBackend(shell, "/app")
+
+    stats = backend.clear_app_cache("com.example", force_stop=True)
+
+    assert stats.bytes == 16 * 1024
+    assert any(c == "am force-stop com.example" for c in shell.calls)
+    assert any(c == "pm clear --cache-only com.example" for c in shell.calls)
+
+
+def test_adb_clear_app_cache_can_skip_force_stop():
+    shell = FakeShell()
+    backend = AdbBackend(shell, "/app")
+    backend.clear_app_cache("com.example", force_stop=False)
+    assert not any(c.startswith("am force-stop") for c in shell.calls)
+
+
+def test_adb_clear_app_cache_survives_force_stop_failure():
+    shell = FakeShell({"am force-stop": (1, "", "nope")})
+    backend = AdbBackend(shell, "/app")
+    backend.clear_app_cache("com.example", force_stop=True)
+    assert any(c.startswith("pm clear") for c in shell.calls)
+
+
+def test_adb_clear_app_cache_propagates_pm_failure():
+    shell = FakeShell({"pm clear": (1, "", "Error: no such package")})
+    backend = AdbBackend(shell, "/app")
+    with pytest.raises(BackendError):
+        backend.clear_app_cache("com.example")
+
+
+def test_adb_installed_packages_parses_pm_output():
+    shell = FakeShell({"pm list": (0, "package:com.a\npackage:com.b\n", "")})
+    backend = AdbBackend(shell, "/app")
+    assert backend.installed_packages() == ["com.a", "com.b"]
+
+
+def test_root_backend_uses_su_runner():
+    shell = FakeShell({"su -c 'du": (0, "2048\t/x\n", "")})
+    backend = RootBackend(shell)
+
+    stats = backend.delete("/data/system/dropbox/x")
+
+    assert stats.bytes == 2048
+    assert all(c.startswith("su -c") for c in shell.calls)
+
+
+def test_root_backend_clear_app_cache_goes_through_su():
+    shell = FakeShell()
+    backend = RootBackend(shell)
+    backend.clear_app_cache("com.example", force_stop=True)
+    assert any("pm clear --cache-only com.example" in c for c in shell.calls)
+    assert all(c.startswith("su -c") for c in shell.calls)
+
+
+def test_root_backend_requires_runner_when_not_root():
+    if __import__("os").geteuid() == 0:
+        pytest.skip("running as root")
+    with pytest.raises(BackendError):
+        RootBackend()
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +361,67 @@ def test_expand_collapses_slashes():
 
 
 # ---------------------------------------------------------------------------
+# package cleaners through the engine
+# ---------------------------------------------------------------------------
+
+def test_scan_package_cleaner_uses_backend_listing(roots):
+    shell = FakeShell({"pm list": (0, "package:com.a\npackage:com.b\n", "")})
+    backend = AdbBackend(shell, roots["app_files"])
+    report = engine.scan(backend, roots, ["other_app_cache"])
+
+    packages = sorted(e.package for e in report.entries if e.package)
+    assert packages == ["com.a", "com.b"]
+    assert all(not e.size_known for e in report.entries)
+
+
+def test_scan_unused_cleaner_needs_kotlin_list(roots):
+    shell = FakeShell({"pm list": (0, "package:com.a\npackage:com.b\n", "")})
+    backend = AdbBackend(shell, roots["app_files"])
+
+    without = engine.scan(backend, roots, ["unused_app_cache"])
+    assert without.entries == []
+
+    with_list = engine.scan(
+        backend, roots, ["unused_app_cache"], unused_packages=["com.b"]
+    )
+    assert [e.package for e in with_list.entries] == ["com.b"]
+
+
+def test_apply_package_cleaner_clears_through_backend(roots):
+    shell = FakeShell({"du -sk": (0, "32\t/x\n", "")})
+    backend = AdbBackend(shell, roots["app_files"])
+
+    report = engine.apply(
+        backend, roots, ["unused_app_cache"], dry_run=False, unused_packages=["com.b"]
+    )
+
+    assert report.failed == 0
+    assert report.freed_bytes == 32 * 1024
+    assert any(c == "pm clear --cache-only com.b" for c in shell.calls)
+    assert any("com.a" not in c for c in shell.calls)
+
+
+def test_apply_package_cleaner_dry_run_touches_nothing(roots):
+    shell = FakeShell()
+    backend = AdbBackend(shell, roots["app_files"])
+    report = engine.apply(
+        backend, roots, ["unused_app_cache"], dry_run=True, unused_packages=["com.b"]
+    )
+    assert report.dry_run
+    assert shell.calls == []
+
+
+def test_apply_package_cleaner_counts_failures(roots):
+    shell = FakeShell({"pm clear": (1, "", "boom")})
+    backend = AdbBackend(shell, roots["app_files"])
+    report = engine.apply(
+        backend, roots, ["unused_app_cache"], dry_run=False, unused_packages=["com.b"]
+    )
+    assert report.failed == 1
+    assert report.freed_bytes == 0
+
+
+# ---------------------------------------------------------------------------
 # api boundary never raises
 # ---------------------------------------------------------------------------
 
@@ -248,15 +430,34 @@ def test_api_returns_error_json_on_bad_mode():
     assert "error" in out
 
 
+def test_api_root_mode_without_runner_errors():
+    out = json.loads(api.list_cleaners('{"mode": "root"}'))
+    assert "error" in out
+    assert "su runner" in out["error"]
+
+
 def test_api_detect_returns_available_list():
     out = json.loads(api.detect("{}"))
     assert "available" in out and "nonroot" in out["available"]
+
+
+def test_api_detect_picks_up_registered_runners():
+    api.set_adb_runner(lambda cmd: json.dumps({"code": 0, "stdout": "", "stderr": ""}))
+    api.set_root_runner(lambda cmd: json.dumps({"code": 0, "stdout": "uid=0(root)", "stderr": ""}))
+    try:
+        out = json.loads(api.detect("{}"))
+        assert "adb" in out["available"]
+        assert "root" in out["available"]
+    finally:
+        api._ADB_RUNNER = None
+        api._ROOT_RUNNER = None
 
 
 def test_api_list_cleaners_with_roots(roots):
     payload = json.dumps({"mode": "nonroot", **roots})
     out = json.loads(api.list_cleaners(payload))
     assert out["backend"]["name"] == "nonroot"
+    assert out["backend"]["supports_packages"] is False
     assert any(c["name"] == "app_cache" for c in out["cleaners"])
 
 

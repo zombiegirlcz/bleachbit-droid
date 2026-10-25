@@ -3,6 +3,11 @@
 Rule of the project (AGENTS.md §10): every filesystem mutation goes through a
 backend. No cleaner and no engine may call ``os.remove``/``shutil.rmtree``
 directly.
+
+Two kinds of operations exist:
+  * path operations  — measure/delete a file or tree
+  * package operations — ask Android itself to clear an app's cache
+    (`pm clear --cache-only`), optionally after force-stopping it
 """
 
 from __future__ import annotations
@@ -32,6 +37,8 @@ class PrivilegeBackend(ABC):
 
     name: str = "abstract"
     capabilities: frozenset[Capability] = frozenset()
+    #: package operations need a shell; path-only backends leave this False
+    supports_packages: bool = False
 
     # --- introspection -------------------------------------------------
     def can(self, cap: Capability) -> bool:
@@ -41,6 +48,7 @@ class PrivilegeBackend(ABC):
         return {
             "name": self.name,
             "capabilities": sorted(c.value for c in self.capabilities),
+            "supports_packages": self.supports_packages,
         }
 
     # --- filesystem ----------------------------------------------------
@@ -59,6 +67,15 @@ class PrivilegeBackend(ABC):
     @abstractmethod
     def exists(self, path: str) -> bool:
         ...
+
+    # --- packages ------------------------------------------------------
+    def clear_app_cache(self, package: str, force_stop: bool = True) -> Stats:
+        """Clear one app's cache through Android, not by touching files."""
+        raise BackendError(f"backend {self.name!r} cannot clear app caches")
+
+    def installed_packages(self) -> list[str]:
+        """Package names visible to this backend."""
+        raise BackendError(f"backend {self.name!r} cannot list packages")
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +122,60 @@ def _local_delete(path: str) -> Stats:
     return stats
 
 
+def shell_quote(value: str) -> str:
+    """POSIX single-quote escaping."""
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _validate_package(package: str) -> str:
+    """Package names are used inside shell commands — validate strictly."""
+    if not package or not all(c.isalnum() or c in "._" for c in package):
+        raise BackendError(f"invalid package name: {package!r}")
+    if not package[0].isalpha():
+        raise BackendError(f"invalid package name: {package!r}")
+    return package
+
+
+class _ShellMixin:
+    """Package operations shared by the shell-based backends."""
+
+    supports_packages = True
+
+    def _shell(self, command: str) -> str:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def _shell_ok(self, command: str) -> str:
+        return self._shell(command)
+
+    def clear_app_cache(self, package: str, force_stop: bool = True) -> Stats:
+        pkg = _validate_package(package)
+        before = 0
+        try:
+            out = self._shell(f"du -sk -- /data/data/{pkg}/cache 2>/dev/null")
+            before = int(out.split()[0]) * 1024 if out.strip() else 0
+        except (BackendError, ValueError, IndexError):
+            before = 0
+
+        if force_stop:
+            # Failure here is not fatal: the cache may still be clearable.
+            try:
+                self._shell(f"am force-stop {pkg}")
+            except BackendError:
+                pass
+
+        self._shell(f"pm clear --cache-only {pkg}")
+        return Stats(files=0, bytes=before)
+
+    def installed_packages(self) -> list[str]:
+        out = self._shell("pm list packages")
+        packages = []
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("package:"):
+                packages.append(line[len("package:"):])
+        return sorted(packages)
+
+
 # ---------------------------------------------------------------------------
 # non-root: only our own app data + shared storage the process can reach
 # ---------------------------------------------------------------------------
@@ -124,7 +195,6 @@ class NonRootBackend(PrivilegeBackend):
                 if os.path.commonpath([real, root]) == root:
                     return real
             except ValueError:
-                # different drives / mixed absolute-relative
                 continue
         raise BackendError(f"outside allowed roots: {path}")
 
@@ -145,7 +215,7 @@ class NonRootBackend(PrivilegeBackend):
 # Shizuku / ADB: can reach other apps' data via `sh -c` run as shell (uid 2000)
 # ---------------------------------------------------------------------------
 
-class AdbBackend(PrivilegeBackend):
+class AdbBackend(_ShellMixin, PrivilegeBackend):
     """Executes through a ``ShizukuRunner`` supplied by the Kotlin side.
 
     The runner interface is a single method ``run(command: str) -> (exit_code,
@@ -158,23 +228,23 @@ class AdbBackend(PrivilegeBackend):
         {Capability.APP_DATA, Capability.SHARED_STORAGE, Capability.OTHER_APP_DATA}
     )
 
-    def __init__(self, runner, app_files_dir: str) -> None:
+    def __init__(self, runner, app_files_dir: str = "") -> None:
         self._runner = runner
-        self._app_files_dir = os.path.realpath(app_files_dir)
+        self._app_files_dir = os.path.realpath(app_files_dir) if app_files_dir else ""
 
     def _guarded(self, path: str) -> str:
         if not os.path.isabs(path) or ".." in path.split(os.sep):
             raise BackendError(f"unsafe path: {path}")
         return path
 
-    def _run(self, command: str) -> str:
+    def _shell(self, command: str) -> str:
         code, out, err = self._runner.run(command)
         if code != 0:
             raise BackendError(f"sh exit {code}: {err.strip() or out.strip()}")
         return out
 
     def measure(self, path: str) -> Stats:
-        out = self._run(f"du -sb -- {shell_quote(self._guarded(path))}")
+        out = self._shell(f"du -sb -- {shell_quote(self._guarded(path))}")
         try:
             size = int(out.split()[0])
         except (IndexError, ValueError) as exc:
@@ -184,7 +254,7 @@ class AdbBackend(PrivilegeBackend):
     def delete(self, path: str) -> Stats:
         target = self._guarded(path)
         before = self.measure(target).bytes
-        self._run(f"rm -rf -- {shell_quote(target)}")
+        self._shell(f"rm -rf -- {shell_quote(target)}")
         return Stats(files=0, bytes=before)
 
     def exists(self, path: str) -> bool:
@@ -193,34 +263,56 @@ class AdbBackend(PrivilegeBackend):
 
 
 # ---------------------------------------------------------------------------
-# root: everything
+# root: everything, optionally through `su`
 # ---------------------------------------------------------------------------
 
-class RootBackend(PrivilegeBackend):
+class RootBackend(_ShellMixin, PrivilegeBackend):
+    """Everything, through direct syscalls when already root, or through a
+    ``su`` runner supplied by the Kotlin side.
+
+    In Chaquopy ``os.geteuid()`` is never 0, so on a rooted device the Kotlin
+    side passes a runner that prefixes commands with ``su -c``.
+    """
+
     name = "root"
     capabilities = frozenset(Capability)
 
-    def __init__(self) -> None:
-        if os.geteuid() != 0:
-            raise BackendError("root backend requires euid 0")
+    def __init__(self, runner=None) -> None:
+        self._runner = runner
+        if runner is None and os.geteuid() != 0:
+            raise BackendError("root backend requires euid 0 or a su runner")
 
+    # -- path ops -------------------------------------------------------
     def measure(self, path: str) -> Stats:
-        return _tree_stats(path)
+        if self._runner is None:
+            return _tree_stats(path)
+        out = self._shell(f"du -sb -- {shell_quote(path)}")
+        try:
+            return Stats(files=0, bytes=int(out.split()[0]))
+        except (IndexError, ValueError) as exc:
+            raise BackendError(f"cannot parse du output: {out!r}") from exc
 
     def delete(self, path: str) -> Stats:
-        return _local_delete(path)
+        if self._runner is None:
+            return _local_delete(path)
+        before = self.measure(path).bytes
+        self._shell(f"rm -rf -- {shell_quote(path)}")
+        return Stats(files=0, bytes=before)
 
     def exists(self, path: str) -> bool:
-        return os.path.lexists(path)
+        if self._runner is None:
+            return os.path.lexists(path)
+        code, _, _ = self._runner.run(f"su -c {shell_quote('test -e ' + shell_quote(path))}")
+        return code == 0
 
-
-# ---------------------------------------------------------------------------
-# utils
-# ---------------------------------------------------------------------------
-
-def shell_quote(value: str) -> str:
-    """POSIX single-quote escaping."""
-    return "'" + value.replace("'", "'\\''") + "'"
+    # -- package ops ----------------------------------------------------
+    def _shell(self, command: str) -> str:
+        if self._runner is None:
+            raise BackendError("root backend without su runner cannot run shell commands")
+        code, out, err = self._runner.run(f"su -c {shell_quote(command)}")
+        if code != 0:
+            raise BackendError(f"su exit {code}: {err.strip() or out.strip()}")
+        return out
 
 
 __all__ = [

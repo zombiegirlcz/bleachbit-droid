@@ -3,11 +3,13 @@ package cz.zombie.bleachbitdroid
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 enum class Phase { IDLE, LOADING, SCANNING, CLEANING }
 
@@ -22,6 +24,8 @@ data class UiState(
     val clean: CleanSummary? = null,
     val message: String? = null,
     val error: String? = null,
+    val usageAccessGranted: Boolean = false,
+    val allFilesAccess: Boolean = false,
 ) {
     val selectedCleaners: List<String>
         get() = cleaners.filter { it.name in selected && it.enabled }.map { it.name }
@@ -39,9 +43,37 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (ShizukuRunner.hasPermission()) {
             PythonBridge.registerAdbRunner(ShizukuRunner())
         }
+        registerRootIfPossible()
+        refreshPermissions()
         detectModes()
         reload()
     }
+
+    /** `su` probe is a blocking process spawn — keep it off the UI thread. */
+    private fun registerRootIfPossible() {
+        viewModelScope.launch(Dispatchers.IO) {
+            if (RootRunner.isAvailable()) {
+                PythonBridge.registerRootRunner(RootRunner())
+                detectModes()
+            }
+        }
+    }
+
+    fun refreshPermissions() {
+        _state.update {
+            it.copy(
+                usageAccessGranted = UsageStatsProvider.hasPermission(context),
+                allFilesAccess = hasAllFilesAccess(),
+            )
+        }
+    }
+
+    fun hasAllFilesAccess(): Boolean =
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            android.os.Environment.isExternalStorageManager()
+        } else {
+            true
+        }
 
     fun onShizukuPermissionResult(granted: Boolean) {
         if (granted) {
@@ -112,12 +144,31 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Package lists computed on the Kotlin side, keyed by cleaner name. */
+    private suspend fun unusedPackagesFor(names: List<String>): List<String>? {
+        val current = _state.value
+        val needsUsage = current.cleaners.any {
+            it.name in names && it.kind == "package" && it.unusedDays > 0
+        }
+        if (!needsUsage) return null
+
+        val days = current.cleaners
+            .filter { it.name in names && it.unusedDays > 0 }
+            .minOfOrNull { it.unusedDays }
+            ?: return null
+
+        return withContext(Dispatchers.IO) { UsageStatsProvider.unusedPackages(context, days) }
+    }
+
     fun scan() {
         viewModelScope.launch {
             val current = _state.value
             _state.update { it.copy(phase = Phase.SCANNING, error = null, message = null, clean = null) }
             try {
-                val summary = CleanerRepository.scan(context, current.mode, current.selectedCleaners)
+                val unused = unusedPackagesFor(current.selectedCleaners)
+                val summary = CleanerRepository.scan(
+                    context, current.mode, current.selectedCleaners, unused
+                )
                 _state.update { it.copy(phase = Phase.IDLE, scan = summary) }
             } catch (t: Throwable) {
                 _state.update { it.copy(phase = Phase.IDLE, error = t.message) }
@@ -130,8 +181,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val current = _state.value
             _state.update { it.copy(phase = Phase.CLEANING, error = null, message = null) }
             try {
+                val unused = unusedPackagesFor(current.selectedCleaners)
                 val summary = CleanerRepository.apply(
-                    context, current.mode, current.selectedCleaners, dryRun,
+                    context, current.mode, current.selectedCleaners, dryRun, unused,
                 )
                 _state.update {
                     it.copy(

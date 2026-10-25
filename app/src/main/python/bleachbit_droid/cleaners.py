@@ -1,8 +1,12 @@
 """Cleaner registry.
 
-Every cleaner must declare ``name``, ``description``, ``requires``, ``paths``
-and ``risk`` (AGENTS.md §8). Paths use ``<placeholder>`` tokens that are
-expanded by the engine with values supplied from Kotlin:
+Every cleaner must declare ``name``, ``description``, ``requires`` and ``risk``
+(AGENTS.md §8). Path cleaners additionally declare ``paths``; package cleaners
+declare ``kind=Kind.PACKAGE`` and are wiped through Android
+(``pm clear --cache-only``) instead of by touching files.
+
+Paths use ``<placeholder>`` tokens expanded by the engine with values supplied
+from Kotlin:
 
     <app_files>     -> Context.getFilesDir()
     <app_cache>     -> Context.getCacheDir()
@@ -14,7 +18,7 @@ expanded by the engine with values supplied from Kotlin:
 
 from __future__ import annotations
 
-from .models import Capability, CleanerSpec, Risk, Target
+from .models import Capability, CleanerSpec, Kind, Risk, Target
 
 APP_FILES = "<app_files>"
 APP_CACHE = "<app_cache>"
@@ -25,6 +29,7 @@ ANDROID_MEDIA = "<android_media>"
 
 
 CLEANERS: tuple[CleanerSpec, ...] = (
+    # -- non-root tier ---------------------------------------------------
     CleanerSpec(
         name="app_cache",
         description="Mezipaměť této aplikace",
@@ -43,11 +48,33 @@ CLEANERS: tuple[CleanerSpec, ...] = (
         paths=(
             Target(f"{ANDROID_MEDIA}/DCIM/.thumbnails/**", Capability.SHARED_STORAGE),
             Target(f"{SDCARD}/DCIM/.thumbnails/**", Capability.SHARED_STORAGE),
+            Target(f"{SDCARD}/Android/data/*/cache/**", Capability.SHARED_STORAGE),
         ),
     ),
+
+    # -- ADB (Shizuku) tier ----------------------------------------------
+    # Android itself knows what is cache; let it clear the cache instead of
+    # rm -rf on /data/data/<pkg>/cache (safe against open files).
+    CleanerSpec(
+        name="other_app_cache",
+        description="Mezipaměť ostatních aplikací",
+        requires=(Capability.OTHER_APP_DATA,),
+        risk=Risk.MEDIUM,
+        kind=Kind.PACKAGE,
+    ),
+    CleanerSpec(
+        name="unused_app_cache",
+        description="Mezipaměť aplikací nepoužitých 30+ dní",
+        requires=(Capability.OTHER_APP_DATA,),
+        risk=Risk.LOW,
+        kind=Kind.PACKAGE,
+        unused_days=30,
+    ),
+
+    # -- root tier -------------------------------------------------------
     CleanerSpec(
         name="logcat_dumps",
-        description="Zachycené systemové logy",
+        description="Zachycené systémové logy a ANR",
         requires=(Capability.SYSTEM,),
         risk=Risk.MEDIUM,
         paths=(
@@ -58,11 +85,11 @@ CLEANERS: tuple[CleanerSpec, ...] = (
     ),
     CleanerSpec(
         name="dalvik_cache",
-        description="Dalvik/ART cache jiných aplikací",
-        requires=(Capability.OTHER_APP_DATA, Capability.APP_DATA),
+        description="ART/Dalvik cache všech aplikací",
+        requires=(Capability.SYSTEM,),
         risk=Risk.MEDIUM,
         paths=(
-            Target(f"{ANDROID_DATA}/*/cache/**", Capability.OTHER_APP_DATA),
+            Target(f"{ANDROID_DATA}/*/code_cache/**", Capability.SYSTEM),
         ),
     ),
     CleanerSpec(

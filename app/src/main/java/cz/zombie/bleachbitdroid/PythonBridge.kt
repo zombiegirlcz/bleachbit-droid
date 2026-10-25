@@ -40,25 +40,41 @@ object PythonBridge {
         mod.callAttr("set_adb_runner", runner)
     }
 
+    /**
+     * Register the `su`-backed shell runner with the Python side.
+     * Must be called before any request with `mode = "root"`.
+     */
+    fun registerRootRunner(runner: ShellRunner) {
+        val mod = module ?: error("PythonBridge.init() not called")
+        mod.callAttr("set_root_runner", runner)
+    }
+
     fun detect(context: Context, mode: String): JSONObject =
         call("detect", basePayload(context, mode).toString())
 
     fun listCleaners(context: Context, mode: String): JSONObject =
         call("list_cleaners", basePayload(context, mode).toString())
 
-    fun scan(context: Context, mode: String, cleaners: List<String>): JSONObject =
-        call("scan", basePayload(context, mode).apply {
-            put("cleaners", cleaners)
-        }.toString())
+    fun scan(
+        context: Context,
+        mode: String,
+        cleaners: List<String>,
+        unusedPackages: List<String>? = null,
+    ): JSONObject = call("scan", basePayload(context, mode).apply {
+        put("cleaners", cleaners)
+        if (unusedPackages != null) put("unused_packages", unusedPackages)
+    }.toString())
 
     fun applyClean(
         context: Context,
         mode: String,
         cleaners: List<String>,
         dryRun: Boolean,
+        unusedPackages: List<String>? = null,
     ): JSONObject = call("apply_clean", basePayload(context, mode).apply {
         put("cleaners", cleaners)
         put("dry_run", dryRun)
+        if (unusedPackages != null) put("unused_packages", unusedPackages)
     }.toString())
 
     private fun basePayload(context: Context, mode: String): JSONObject = JSONObject().apply {
@@ -73,10 +89,11 @@ object PythonBridge {
 }
 
 /**
- * A single shell command runner. Implemented by [ShizukuRunner]; kept as an
- * interface so tests and the non-root mode can stub it out.
+ * A single shell command runner. Implemented by [ShizukuRunner] and
+ * [RootRunner]; kept as an interface so tests and the non-root mode can stub
+ * it out.
  */
 interface ShellRunner {
-    /** Runs `command` through `sh -c` and returns a JSON object string. */
+    /** Runs `command` and returns a JSON object string `{code,stdout,stderr}`. */
     fun run(command: String): String
 }

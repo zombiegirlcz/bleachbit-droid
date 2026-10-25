@@ -50,7 +50,10 @@ def _backend(data: dict[str, Any]):
     roots = _roots(data)
 
     if mode == "root":
-        return RootBackend()
+        runner = _ROOT_RUNNER
+        if runner is None:
+            raise BackendError("root backend requested but no su runner registered")
+        return RootBackend(runner)
     if mode == "adb":
         runner = _ADB_RUNNER
         if runner is None:
@@ -63,10 +66,12 @@ def _backend(data: dict[str, Any]):
 
 
 # ---------------------------------------------------------------------------
-# Shizuku runner injection
+# Shell runner injection (Shizuku for ADB tier, su for root tier)
 # ---------------------------------------------------------------------------
 
-class _AdbRunner:
+class _ShellRunner:
+    """Wraps a Kotlin ``ShellRunner`` (``run(cmd) -> json``)."""
+
     def __init__(self, fn: Callable[[str], Any]) -> None:
         self._fn = fn
 
@@ -80,13 +85,20 @@ class _AdbRunner:
         )
 
 
-_ADB_RUNNER: _AdbRunner | None = None
+_ADB_RUNNER: _ShellRunner | None = None
+_ROOT_RUNNER: _ShellRunner | None = None
 
 
 def set_adb_runner(fn: Callable[[str], Any]) -> None:
     """Register the Kotlin Shizuku bridge (called once at app start)."""
     global _ADB_RUNNER
-    _ADB_RUNNER = _AdbRunner(fn)
+    _ADB_RUNNER = _ShellRunner(fn)
+
+
+def set_root_runner(fn: Callable[[str], Any]) -> None:
+    """Register the Kotlin ``su`` bridge; only call when root was granted."""
+    global _ROOT_RUNNER
+    _ROOT_RUNNER = _ShellRunner(fn)
 
 
 # ---------------------------------------------------------------------------
@@ -99,11 +111,17 @@ def detect(data: dict[str, Any]) -> dict[str, Any]:
     available: list[str] = ["nonroot"]
     notes: dict[str, str] = {}
 
-    try:
-        RootBackend()
-        available.append("root")
-    except BackendError as exc:
-        notes["root"] = str(exc)
+    if _ROOT_RUNNER is not None:
+        try:
+            code, out, _ = _ROOT_RUNNER.run("id")
+            if code == 0 and "uid=0" in out:
+                available.append("root")
+            else:
+                notes["root"] = f"id said {out.strip()!r} (exit {code})"
+        except Exception as exc:  # noqa: BLE001
+            notes["root"] = f"{type(exc).__name__}: {exc}"
+    else:
+        notes["root"] = "su runner not registered"
 
     if _ADB_RUNNER is not None:
         try:
@@ -132,7 +150,12 @@ def list_cleaners(data: dict[str, Any]) -> dict[str, Any]:
 @_safe
 def scan(data: dict[str, Any]) -> dict[str, Any]:
     backend = _backend(data)
-    report = engine.scan(backend, _roots(data), data.get("cleaners"))
+    report = engine.scan(
+        backend,
+        _roots(data),
+        data.get("cleaners"),
+        data.get("unused_packages"),
+    )
     return report.to_dict()
 
 
@@ -144,6 +167,7 @@ def apply_clean(data: dict[str, Any]) -> dict[str, Any]:
         _roots(data),
         data.get("cleaners"),
         bool(data.get("dry_run", True)),
+        data.get("unused_packages"),
     )
     return report.to_dict()
 
@@ -154,4 +178,5 @@ __all__ = [
     "list_cleaners",
     "scan",
     "set_adb_runner",
+    "set_root_runner",
 ]

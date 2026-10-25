@@ -42,4 +42,10 @@ class MainActivity : ComponentActivity() {
             viewModel.onShizukuPermissionResult(granted)
         }
     }
+
+    override fun onResume() {
+        super.onResume()
+        // The user may have flipped all-files / usage-access in system settings.
+        viewModel.refreshPermissions()
+    }
 }

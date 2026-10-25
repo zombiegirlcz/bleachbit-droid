@@ -1,5 +1,8 @@
 package cz.zombie.bleachbitdroid
 
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,6 +16,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -21,11 +25,12 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -47,6 +52,7 @@ private fun riskLabel(risk: String): String = when (risk) {
 @Composable
 fun CleanerScreen(viewModel: MainViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val context = LocalContext.current
 
     Scaffold(
         topBar = { TopAppBar(title = { Text("BleachBit Droid") }) },
@@ -79,6 +85,26 @@ fun CleanerScreen(viewModel: MainViewModel) {
                 )
             }
 
+            // Extra access that unlocks deeper cleaning even in non-root mode.
+            if (!state.allFilesAccess && android.os.Build.VERSION.SDK_INT >= 30) {
+                TextButton(onClick = {
+                    val intent = Intent(
+                        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:" + context.packageName),
+                    )
+                    context.startActivity(intent)
+                }) {
+                    Text("Povolit přístup ke všem souborům")
+                }
+            }
+            if (!state.usageAccessGranted) {
+                TextButton(onClick = {
+                    context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                }) {
+                    Text("Povolit přístup k využití aplikací")
+                }
+            }
+
             Spacer(Modifier.height(12.dp))
 
             when (state.phase) {
@@ -96,6 +122,12 @@ fun CleanerScreen(viewModel: MainViewModel) {
                                     "Nalezeno ${formatBytes(scan.totalBytes)} v ${scan.entries} položkách",
                                     fontWeight = FontWeight.Bold,
                                 )
+                                if (scan.unknownSizeEntries > 0) {
+                                    Text(
+                                        "${scan.unknownSizeEntries} položek (cache aplikací) — velikost se ukáže po vyčištění",
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
+                                }
                                 scan.perCleaner.forEach { (name, bytes) ->
                                     Text(
                                         "$name: ${formatBytes(bytes)}",

@@ -6,8 +6,12 @@ The engine:
   3. walks the paths, measuring what would be freed,
   4. on apply, deletes through the backend and logs every decision.
 
+Package cleaners (``kind=Kind.PACKAGE``) do not touch files at all: they ask
+the backend to clear an app's cache through Android.
+
 The engine never touches the filesystem for mutation itself — it only calls
-``backend.measure()`` / ``backend.delete()`` (AGENTS.md §10).
+``backend.measure()`` / ``backend.delete()`` / ``backend.clear_app_cache()``
+(AGENTS.md §10).
 """
 
 from __future__ import annotations
@@ -21,14 +25,13 @@ from .capabilities import missing
 from .cleaners import all_cleaners, by_name
 from .models import (
     Action,
-    Capability,
     CleanerSpec,
     CleanReport,
     Entry,
+    Kind,
     LogRecord,
     Result,
     ScanReport,
-    Target,
 )
 
 
@@ -54,22 +57,15 @@ def expand(path: str, roots: dict[str, str]) -> str:
 def expand_pattern(pattern: str, roots: dict[str, str]) -> str:
     """Expand placeholders and normalise a glob pattern."""
     expanded = expand(pattern, roots)
-    # collapse duplicate separators but keep the leading one
     return re.sub(r"/{2,}", "/", expanded)
 
 
 def _glob(pattern: str) -> list[str]:
-    """Expand a glob; ``**`` is treated recursively."""
     return sorted(glob.glob(pattern, recursive=True))
 
 
 def _iter_leaves(path: str) -> list[str]:
-    """Return deletable leaves under ``path``.
-
-    For a directory we return its contents (files and empty dirs), not the
-    directory itself — deleting the directory would break apps that expect it
-    to exist (e.g. ``cache``).
-    """
+    """Return deletable leaves under ``path`` (never the root dir itself)."""
     if os.path.islink(path) or not os.path.isdir(path):
         return [path]
     leaves: list[str] = []
@@ -99,7 +95,14 @@ def select_cleaners(
 ) -> list[CleanerSpec]:
     """Return cleaners that ``backend`` can actually run."""
     pool = [by_name(n) for n in names] if names else list(all_cleaners())
-    return [spec for spec in pool if not missing(spec.requires, backend.capabilities)]
+    result = []
+    for spec in pool:
+        if missing(spec.requires, backend.capabilities):
+            continue
+        if spec.kind is Kind.PACKAGE and not backend.supports_packages:
+            continue
+        result.append(spec)
+    return result
 
 
 def describe(backend: PrivilegeBackend) -> list[dict]:
@@ -107,11 +110,37 @@ def describe(backend: PrivilegeBackend) -> list[dict]:
     out = []
     for spec in all_cleaners():
         miss = missing(spec.requires, backend.capabilities)
+        if spec.kind is Kind.PACKAGE and not backend.supports_packages:
+            miss = miss + ["shell"] if "shell" not in miss else miss
         item = spec.to_dict()
         item["enabled"] = not miss
-        item["missing"] = [c.value for c in miss]
+        item["missing"] = list(miss)
         out.append(item)
     return out
+
+
+# ---------------------------------------------------------------------------
+# package selection
+# ---------------------------------------------------------------------------
+
+def _package_candidates(
+    backend: PrivilegeBackend,
+    spec: CleanerSpec,
+    unused: list[str] | None,
+) -> list[str]:
+    """Packages a package cleaner should operate on.
+
+    ``unused`` is the list computed by Kotlin from UsageStatsManager and is
+    only meaningful for cleaners with ``unused_days`` set. When Kotlin could
+    not compute it (permission missing), the cleaner is skipped rather than
+    guessing.
+    """
+    if spec.unused_days is not None:
+        return list(unused or [])
+    try:
+        return backend.installed_packages()
+    except BackendError:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -122,10 +151,41 @@ def scan(
     backend: PrivilegeBackend,
     roots: dict[str, str],
     names: list[str] | None = None,
+    unused_packages: list[str] | None = None,
 ) -> ScanReport:
     report = ScanReport(backend=backend.name)
     seen: set[str] = set()
+
     for spec in select_cleaners(backend, names):
+        if spec.kind is Kind.PACKAGE:
+            for pkg in _package_candidates(backend, spec, unused_packages):
+                key = f"package:{pkg}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                report.entries.append(
+                    Entry(
+                        cleaner=spec.name,
+                        path=f"/data/data/{pkg}/cache",
+                        size=0,
+                        is_dir=True,
+                        requires=spec.requires[0],
+                        package=pkg,
+                        size_known=False,
+                    )
+                )
+                report.log.append(
+                    LogRecord(
+                        backend=backend.name,
+                        cleaner=spec.name,
+                        path=pkg,
+                        action=Action.SCAN,
+                        result=Result.OK,
+                        reason="package cache, size known after clearing",
+                    )
+                )
+            continue
+
         for target in spec.paths:
             if not backend.can(target.requires):
                 report.log.append(
@@ -158,8 +218,6 @@ def scan(
                 if not backend.exists(match):
                     continue
                 for leaf in _iter_leaves(match):
-                    # Patterns overlap (a dir glob also matches its children);
-                    # report every path at most once.
                     if leaf in seen:
                         continue
                     try:
@@ -210,14 +268,10 @@ def apply(
     roots: dict[str, str],
     names: list[str] | None = None,
     dry_run: bool = True,
+    unused_packages: list[str] | None = None,
 ) -> CleanReport:
-    if not dry_run:
-        # Never mutate system paths in non-root mode: the guard is here so a
-        # caller cannot bypass it by passing dry_run=False.
-        pass
-
     report = CleanReport(backend=backend.name, dry_run=dry_run)
-    scanned = scan(backend, roots, names)
+    scanned = scan(backend, roots, names, unused_packages)
 
     for entry in scanned.entries:
         if not backend.can(entry.requires):
@@ -244,12 +298,16 @@ def apply(
                     action=Action.DELETE,
                     bytes=entry.size,
                     result=Result.DRY_RUN,
+                    reason="" if entry.size_known else "size known after clearing",
                 )
             )
             continue
 
         try:
-            stats = backend.delete(entry.path)
+            if entry.package:
+                stats = backend.clear_app_cache(entry.package)
+            else:
+                stats = backend.delete(entry.path)
         except (BackendError, OSError) as exc:
             report.failed += 1
             report.log.append(
