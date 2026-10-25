@@ -1,6 +1,7 @@
 package cz.zombie.bleachbitdroid
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -49,6 +50,10 @@ private data class Access(
  */
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
+    private companion object {
+        const val TAG = "MainViewModel"
+    }
+
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
 
@@ -78,12 +83,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun refreshPermissions() {
         viewModelScope.launch {
             val access = withContext(Dispatchers.IO) {
+                Log.i(TAG, "refresh: checking shizuku")
                 val shizuku = ShizukuRunner.hasPermission()
+                Log.i(TAG, "refresh: shizuku=$shizuku")
                 if (shizuku) {
                     PythonBridge.registerAdbRunner(ShizukuRunner())
+                    Log.i(TAG, "refresh: adb runner registered")
                 }
                 // Bounded probe: a pending Magisk prompt must not stall startup.
+                Log.i(TAG, "refresh: probing root")
                 val root = RootRunner.isAvailable()
+                Log.i(TAG, "refresh: root=$root")
                 if (root) {
                     PythonBridge.registerRootRunner(RootRunner())
                 }
@@ -95,6 +105,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
 
+            Log.i(TAG, "refresh: done $access")
             _state.update {
                 it.copy(
                     usageAccessGranted = access.usageStats,
