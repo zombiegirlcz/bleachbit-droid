@@ -56,6 +56,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         PythonBridge.init(context)
+
+        // The Shizuku binder is delivered *after* the activity starts, so a
+        // one-shot check at startup would never see it. React to binder and
+        // permission events instead of polling.
+        ShizukuRunner.onBinderChanged = { refreshPermissions() }
+        ShizukuRunner.startListeners()
+
         refreshPermissions()
         reload()
     }
