@@ -60,6 +60,14 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+        jniLibs {
+            // libelf_loader.so is a prebuilt bionic binary, not something the
+            // NDK produced, so AGP must not try to strip it.
+            keepDebugSymbols += "**/libelf_loader.so"
+            // Keep native libs as separate files on disk. The loader is exec'd
+            // straight from nativeLibraryDir, which needs a real file.
+            useLegacyPackaging = true
+        }
     }
 
 }

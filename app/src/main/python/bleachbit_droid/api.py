@@ -194,8 +194,45 @@ def apply_clean(data: dict[str, Any]) -> dict[str, Any]:
     return report.to_dict()
 
 
+def _as_callback(value):
+    """Wrap a Kotlin object exposing ``onEvent(String)`` as a Python callable.
+
+    Chaquopy passes Java objects into Python as ``PyObject``. Calling
+    ``callAttr`` on it from a worker thread is safe, and exceptions are
+    swallowed because progress reporting must never abort a clean.
+    """
+    if value is None:
+        return None
+    if callable(value):
+        return value
+
+    def invoke(event: dict) -> None:
+        value.callAttr("onEvent", json.dumps(event, ensure_ascii=False))
+
+    return invoke
+
+
+@_safe
+def apply_clean_streaming(data: dict[str, Any]) -> dict[str, Any]:
+    """Like ``apply_clean`` but forwards every step to ``data["callback"]``.
+
+    The callback receives JSON strings; the UI renders them as a live log.
+    """
+    backend = _backend(data)
+    report = engine.apply(
+        backend,
+        _roots(data),
+        _as_list(data.get("cleaners")),
+        bool(data.get("dry_run", True)),
+        _as_list(data.get("unused_packages")),
+        _as_callback(data.get("callback")),
+    )
+    return report.to_dict()
+
+
 __all__ = [
     "apply_clean",
+    "apply_clean_streaming",
     "detect",
     "list_cleaners",
     "scan",

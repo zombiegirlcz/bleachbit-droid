@@ -16,6 +16,8 @@ The engine never touches the filesystem for mutation itself — it only calls
 
 from __future__ import annotations
 
+from typing import Any, Callable
+
 import glob
 import os
 import re
@@ -269,12 +271,33 @@ def apply(
     names: list[str] | None = None,
     dry_run: bool = True,
     unused_packages: list[str] | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> CleanReport:
-    report = CleanReport(backend=backend.name, dry_run=dry_run)
-    scanned = scan(backend, roots, names, unused_packages)
+    """Scan, then delete through the backend, reporting progress as it goes.
 
-    for entry in scanned.entries:
+    ``on_event`` receives one plain dict per step so the UI can show a live log
+    the way BleachBit does. A failing callback must never abort a clean, so
+    every call is guarded.
+    """
+
+    def emit(kind: str, **fields: Any) -> None:
+        if on_event is None:
+            return
+        try:
+            on_event({"type": kind, **fields})
+        except Exception:  # noqa: BLE001 - progress must not break cleaning
+            pass
+
+    report = CleanReport(backend=backend.name, dry_run=dry_run)
+    emit("start", backend=backend.name, dry_run=dry_run)
+
+    scanned = scan(backend, roots, names, unused_packages)
+    total = len(scanned.entries)
+    emit("scanned", entries=total, bytes=scanned.total_bytes)
+
+    for index, entry in enumerate(scanned.entries, start=1):
         if not backend.can(entry.requires):
+            reason = f"missing capability {entry.requires.value}"
             report.log.append(
                 LogRecord(
                     backend=backend.name,
@@ -283,8 +306,17 @@ def apply(
                     action=Action.SKIP,
                     bytes=entry.size,
                     result=Result.DENIED,
-                    reason=f"missing capability {entry.requires.value}",
+                    reason=reason,
                 )
+            )
+            emit(
+                "skip",
+                index=index,
+                total=total,
+                path=entry.path,
+                cleaner=entry.cleaner,
+                bytes=entry.size,
+                reason=reason,
             )
             continue
 
@@ -300,6 +332,14 @@ def apply(
                     result=Result.DRY_RUN,
                     reason="" if entry.size_known else "size known after clearing",
                 )
+            )
+            emit(
+                "would_delete",
+                index=index,
+                total=total,
+                path=entry.path,
+                cleaner=entry.cleaner,
+                bytes=entry.size,
             )
             continue
 
@@ -321,6 +361,15 @@ def apply(
                     reason=str(exc),
                 )
             )
+            emit(
+                "failed",
+                index=index,
+                total=total,
+                path=entry.path,
+                cleaner=entry.cleaner,
+                bytes=entry.size,
+                reason=str(exc),
+            )
             continue
 
         report.deleted += stats.files
@@ -335,6 +384,21 @@ def apply(
                 result=Result.OK,
             )
         )
+        emit(
+            "deleted",
+            index=index,
+            total=total,
+            path=entry.path,
+            cleaner=entry.cleaner,
+            bytes=stats.bytes,
+        )
+
+    emit(
+        "done",
+        freed_bytes=report.freed_bytes,
+        deleted=report.deleted,
+        failed=report.failed,
+    )
 
     return report
 

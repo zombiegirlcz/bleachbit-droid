@@ -68,6 +68,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         ShizukuRunner.onBinderChanged = { refreshPermissions() }
         ShizukuRunner.startListeners()
 
+        // Install the bundled glibc toolchain and prove it runs, off the main
+        // thread: extraction touches disk and the smoke test spawns processes.
+        viewModelScope.launch(Dispatchers.IO) {
+            RootfsInstaller.ensure(context)
+            GuestSelfTest.run(context)
+        }
+
         // Detect modes first so the UI is usable immediately. The root probe
         // spawns `su`, which blocks on a Magisk prompt until the user answers.
         detectModes()
