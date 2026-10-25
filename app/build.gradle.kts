@@ -21,12 +21,25 @@ android {
         }
     }
 
+    // A committed debug keystore keeps APK signatures stable across CI runs.
+    // Without it every workflow run generates a fresh key and `pm install -r`
+    // fails with INSTALL_FAILED_UPDATE_INCOMPATIBLE.
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
         }
         debug {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
