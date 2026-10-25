@@ -31,6 +31,22 @@ data class UiState(
         get() = cleaners.filter { it.name in selected && it.enabled }.map { it.name }
 }
 
+private data class Access(
+    val shizuku: Boolean,
+    val root: Boolean,
+    val usageStats: Boolean,
+    val allFiles: Boolean,
+)
+
+/**
+ * All Shizuku work happens off the main thread.
+ *
+ * This is not a nicety: a binder call from the main thread propagates the
+ * caller's StrictMode thread policy to the callee. `shizuku_server` then runs
+ * its permission check (an HTTP request) on that same thread and dies with
+ * `NetworkOnMainThreadException`, which it reports back as "app has no
+ * permission" even when the grant exists.
+ */
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _state = MutableStateFlow(UiState())
@@ -40,44 +56,42 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         PythonBridge.init(context)
-        if (ShizukuRunner.hasPermission()) {
-            PythonBridge.registerAdbRunner(ShizukuRunner())
-        }
-        registerRootIfPossible()
         refreshPermissions()
-        detectModes()
         reload()
     }
 
-    /** `su` probe is a blocking process spawn — keep it off the UI thread. */
-    private fun registerRootIfPossible() {
-        viewModelScope.launch(Dispatchers.IO) {
-            if (RootRunner.isAvailable()) {
-                PythonBridge.registerRootRunner(RootRunner())
-                detectModes()
-            }
-        }
-    }
-
     /**
-     * Re-read runtime permissions and re-register the Shizuku runner.
-     *
-     * Shizuku access can be granted while the app is in the background (via
-     * `nh shizuku grant` or the Shizuku app), so `onResume` must not only
-     * refresh the flags but also re-register the runner and re-detect modes.
+     * Re-read runtime permissions, (re-)register shell runners and re-detect
+     * available privilege levels. Runs entirely on IO: `hasPermission()` is a
+     * binder call and `RootRunner.isAvailable()` spawns a process.
      */
     fun refreshPermissions() {
-        val shizukuGranted = ShizukuRunner.hasPermission()
-        if (shizukuGranted) {
-            PythonBridge.registerAdbRunner(ShizukuRunner())
+        viewModelScope.launch {
+            val access = withContext(Dispatchers.IO) {
+                val shizuku = ShizukuRunner.hasPermission()
+                if (shizuku) {
+                    PythonBridge.registerAdbRunner(ShizukuRunner())
+                }
+                val root = RootRunner.isAvailable()
+                if (root) {
+                    PythonBridge.registerRootRunner(RootRunner())
+                }
+                Access(
+                    shizuku = shizuku,
+                    root = root,
+                    usageStats = UsageStatsProvider.hasPermission(context),
+                    allFiles = hasAllFilesAccess(),
+                )
+            }
+
+            _state.update {
+                it.copy(
+                    usageAccessGranted = access.usageStats,
+                    allFilesAccess = access.allFiles,
+                )
+            }
+            detectModes()
         }
-        _state.update {
-            it.copy(
-                usageAccessGranted = UsageStatsProvider.hasPermission(context),
-                allFilesAccess = hasAllFilesAccess(),
-            )
-        }
-        detectModes()
     }
 
     fun hasAllFilesAccess(): Boolean =
@@ -89,23 +103,27 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun onShizukuPermissionResult(granted: Boolean) {
         if (granted) {
-            PythonBridge.registerAdbRunner(ShizukuRunner())
+            viewModelScope.launch(Dispatchers.IO) {
+                PythonBridge.registerAdbRunner(ShizukuRunner())
+            }
         }
-        detectModes()
+        refreshPermissions()
         reload()
     }
 
     private fun detectModes() {
         viewModelScope.launch {
             val modes = try {
-                val json = PythonBridge.detect(context, _state.value.mode.id)
+                val json = withContext(Dispatchers.IO) {
+                    PythonBridge.detect(context, _state.value.mode.id)
+                }
                 val arr = json.optJSONArray("available")
                 buildList {
                     add(PrivilegeMode.NONROOT)
                     if (arr != null) {
                         for (i in 0 until arr.length()) {
                             when (arr.getString(i)) {
-                                "adb" -> if (ShizukuRunner.hasPermission()) add(PrivilegeMode.ADB)
+                                "adb" -> add(PrivilegeMode.ADB)
                                 "root" -> add(PrivilegeMode.ROOT)
                             }
                         }
@@ -120,8 +138,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun selectMode(mode: PrivilegeMode) {
         if (_state.value.mode == mode) return
-        if (mode == PrivilegeMode.ADB && !ShizukuRunner.hasPermission()) {
-            ShizukuRunner.requestPermission()
+        if (mode == PrivilegeMode.ADB) {
+            viewModelScope.launch {
+                val granted = withContext(Dispatchers.IO) { ShizukuRunner.hasPermission() }
+                if (!granted) {
+                    ShizukuRunner.requestPermission()
+                    return@launch
+                }
+                _state.update {
+                    it.copy(mode = mode, scan = null, clean = null, selected = emptySet())
+                }
+                reload()
+            }
             return
         }
         _state.update { it.copy(mode = mode, scan = null, clean = null, selected = emptySet()) }
@@ -156,15 +184,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Package lists computed on the Kotlin side, keyed by cleaner name. */
+    /** Package list for cleaners that only touch apps unused for N days. */
     private suspend fun unusedPackagesFor(names: List<String>): List<String>? {
-        val current = _state.value
-        val needsUsage = current.cleaners.any {
-            it.name in names && it.kind == "package" && it.unusedDays > 0
-        }
-        if (!needsUsage) return null
-
-        val days = current.cleaners
+        val days = _state.value.cleaners
             .filter { it.name in names && it.unusedDays > 0 }
             .minOfOrNull { it.unusedDays }
             ?: return null
@@ -175,11 +197,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun scan() {
         viewModelScope.launch {
             val current = _state.value
-            _state.update { it.copy(phase = Phase.SCANNING, error = null, message = null, clean = null) }
+            _state.update {
+                it.copy(phase = Phase.SCANNING, error = null, message = null, clean = null)
+            }
             try {
                 val unused = unusedPackagesFor(current.selectedCleaners)
                 val summary = CleanerRepository.scan(
-                    context, current.mode, current.selectedCleaners, unused
+                    context, current.mode, current.selectedCleaners, unused,
                 )
                 _state.update { it.copy(phase = Phase.IDLE, scan = summary) }
             } catch (t: Throwable) {
