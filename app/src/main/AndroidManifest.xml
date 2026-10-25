@@ -11,7 +11,7 @@
     <!-- Non-root tier: full /sdcard access (Android 11+ requires this). -->
     <uses-permission
         android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
-        android:tools:ignore="ScopedStorage" />
+        tools:ignore="ScopedStorage" />
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
@@ -29,7 +29,7 @@
     <!-- Only for the usage-stats cleaner (which apps are unused). -->
     <uses-permission
         android:name="android.permission.PACKAGE_USAGE_STATS"
-        android:tools:ignore="ProtectedPermissions" />
+        tools:ignore="ProtectedPermissions" />
 
     <application
         android:allowBackup="false"
