@@ -25,4 +25,4 @@ app/build/python/
 # misc
 .DS_Store
 *.log
-ktlint
+ktlintapkmanifest.xml

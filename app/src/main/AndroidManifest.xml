@@ -1,10 +1,35 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- Package list: needed to map /data/data/u0_aXXX dirs to package names. -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
 
     <!-- Shizuku: lets the app run shell commands as uid 2000 (ADB tier). -->
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+
+    <!-- Non-root tier: full /sdcard access (Android 11+ requires this). -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        android:tools:ignore="ScopedStorage" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <!-- Long scans must survive the user leaving the app. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Only for the usage-stats cleaner (which apps are unused). -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        android:tools:ignore="ProtectedPermissions" />
 
     <application
         android:allowBackup="false"
