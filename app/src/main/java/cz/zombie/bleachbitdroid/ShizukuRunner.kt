@@ -53,6 +53,40 @@ class ShizukuRunner : ShellRunner {
         private const val TAG = "ShizukuRunner"
         const val REQUEST_CODE = 421
 
+        private val binderReceived = Shizuku.OnBinderReceivedListener {
+            Log.i(TAG, "shizuku binder received")
+            onBinderChanged?.invoke()
+        }
+        private val binderDead = Shizuku.OnBinderDeadListener {
+            Log.i(TAG, "shizuku binder dead")
+            onBinderChanged?.invoke()
+        }
+        private val permissionResult = Shizuku.OnRequestPermissionResultListener { code, grant ->
+            if (code == REQUEST_CODE) {
+                Log.i(TAG, "shizuku permission result: $grant")
+                onBinderChanged?.invoke()
+            }
+        }
+
+        /**
+         * Called whenever the Shizuku binder appears/disappears or the grant
+         * changes. The binder is delivered *after* the activity starts, so a
+         * one-shot check at startup would miss it.
+         */
+        @Volatile
+        var onBinderChanged: (() -> Unit)? = null
+
+        /** Register listeners; safe to call more than once. */
+        fun startListeners() {
+            try {
+                Shizuku.addBinderReceivedListenerSticky(binderReceived)
+                Shizuku.addBinderDeadListener(binderDead)
+                Shizuku.addRequestPermissionResultListener(permissionResult)
+            } catch (t: Throwable) {
+                Log.w(TAG, "cannot register shizuku listeners", t)
+            }
+        }
+
         /** True when the Shizuku service is running and reachable. */
         fun isAvailable(): Boolean = try {
             Shizuku.pingBinder()
@@ -69,7 +103,7 @@ class ShizukuRunner : ShellRunner {
             false
         }
 
-        /** Ask the user to grant Shizuku access; result arrives in the activity. */
+        /** Ask the user to grant Shizuku access; result arrives in the listener. */
         fun requestPermission() {
             if (!isAvailable()) return
             try {
