@@ -10,6 +10,7 @@ Teze: čím vyšší oprávnění, tím hlubší čistka (capability gating).
 ## Stack (rozhodnuto)
 
 - Kotlin + Jetpack Compose (UI) — `app/src/main/java/cz/zombie/bleachbitdroid/`
+- **Vestavěný glibc toolchain** (elf_loader) — non-root tier umí `shred`, `sqlite3`, `find`
 - Python core přes **Chaquopy 17.1.0**, Python 3.13 — `app/src/main/python/bleachbit_droid/`
 - Gradle 8.14.3, AGP 8.13.2, Kotlin 2.2.21, JDK 21, **compileSdk 36**, minSdk 26
 - Shizuku API 13.1.5 (`dev.rikka.shizuku:api`, `:provider`)
@@ -46,6 +47,33 @@ Cleaner se spustí jen když `requires ⊆ backend.capabilities`
   Volitelně předtím `am force-stop <pkg>`.
   `unused_days=N` znamená, že seznam balíčků dodá Kotlin (`UsageStatsProvider`);
   bez seznamu se cleaner přeskočí (radši nic než mazat špatné appky).
+
+### Vestavěný glibc toolchain (elf_loader)
+
+Android neumí spustit glibc binárku (`execve` na `/lib/ld-linux-aarch64.so.1`
+selže) a `sqlite3`/`shred`/GNU `find` v něm nejsou. Proto je v APK loader
+z projektu `~/elf_loader`, který guest binárku own-loadne do privátního scope.
+
+| co | kde | proč tam |
+|---|---|---|
+| `libelf_loader.so` | `jniLibs/arm64-v8a/` | bionic, Android ho extrahuje do `nativeLibraryDir` a dovolí `execve` |
+| `usr/bin/{shred,sqlite3,find}` | `assets/rootfs/` | 6,7 MB; loader je jen `mmap`uje, `execve` se ho netýká |
+| 12 glibc knihoven | `assets/rootfs/usr/lib/aarch64-linux-gnu/` | musí zůstat původní sonames (`libc.so.6`), jinak `DT_NEEDED` selže |
+
+**Proč ne `libc.so.6` do `jniLibs`:** Android extrahuje z `lib/<abi>/` jen
+soubory končící na `.so`, takže `libc.so.6` by zmizel. Přejmenovat nejde —
+loader hledá závislosti podle soname. Proto assets + `filesDir`, kde `mmap`
+funguje (zákaz `execve` na app datech se sem nevztahuje).
+
+**Ověřeno na zařízení jako app uid:**
+- `shred` 9.7 — overwrite → rename chain `00000→…→0` → removed
+- `find` 4.10 — `-mtime +90`, `-empty`, `-size +100k` správně
+- `sqlite3` — **VACUUM 2 056 192 B → 8 192 B**, `integrity_check = ok`
+  (to žádný Android nativní nástroj neumí)
+
+`GuestTool` (Kotlin) spouští nástroje s `ELF_ROOTFS`; streamy čte v daemon
+vláknech s timeoutem, stejně jako `RootRunner`/`ShizukuRunner`.
+`GuestSelfTest` projede všechny tři při startu → výsledek v logcatu.
 
 ### Bezpečnostní invarianty (držet!)
 
