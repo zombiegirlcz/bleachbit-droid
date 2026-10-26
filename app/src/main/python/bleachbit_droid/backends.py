@@ -111,6 +111,15 @@ class PrivilegeBackend(ABC):
             for leaf in self.leaves(match):
                 if leaf in seen:
                     continue
+                # Files only. `_iter_leaves()` also returns *empty directories*
+                # (so a clean can tidy up after itself), and the shell backend
+                # filters to `-type f -o -type l` on its own. Without this check
+                # the two backends disagreed: a local scan offered empty
+                # directories as deletable entries, so a recursive cleaner such
+                # as staging_tmp would remove the directory tree that holds the
+                # tools living in /data/local/tmp.
+                if self.is_dir(leaf) and not self.is_file(leaf):
+                    continue
                 seen.add(leaf)
                 try:
                     out.append((leaf, self.size(leaf)))

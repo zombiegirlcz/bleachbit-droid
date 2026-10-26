@@ -189,10 +189,15 @@ CLEANERS: tuple[CleanerSpec, ...] = (
     # default in the UI (only cleaners the user selects are run).
     CleanerSpec(
         name="staging_tmp",
-        description="Dočasné soubory ve /data/local/tmp (~1,5 GB)",
+        description="Soubory ve /data/local/tmp (~1,5 GB), adresáře zůstanou",
         requires=(Capability.SYSTEM,),
         risk=Risk.HIGH,
         paths=(
+            # Recursive, but the engine only ever deletes *files* (list_sized
+            # filters to -type f / -type l and never yields a directory), so the
+            # directory tree itself survives. That matters here: the tools kept
+            # in /data/local/tmp live in subdirectories (shz/, lib/, ad/), and
+            # only the loose one-off files in them are disposable.
             Target("/data/local/tmp/**", Capability.SYSTEM),
         ),
     ),

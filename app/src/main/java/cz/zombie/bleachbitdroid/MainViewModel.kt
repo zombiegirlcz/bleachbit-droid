@@ -214,7 +214,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         phase = Phase.IDLE,
                         backend = backend,
                         cleaners = cleaners,
-                        selected = cleaners.filter { c -> c.enabled }.map { c -> c.name }.toSet(),
+                        // HIGH-risk cleaners start unchecked. They are shared
+                        // scratch space someone put there on purpose (or a
+                        // one-off dataset), so the user must opt in explicitly
+                        // instead of losing it to a stray tap on "Vyčistit".
+                        selected = cleaners
+                            .filter { c -> c.enabled && c.risk != "high" }
+                            .map { c -> c.name }
+                            .toSet(),
                     )
                 }
             } catch (t: Throwable) {
