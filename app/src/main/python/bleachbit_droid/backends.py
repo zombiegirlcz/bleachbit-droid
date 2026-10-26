@@ -12,6 +12,7 @@ Two kinds of operations exist:
 
 from __future__ import annotations
 
+import glob
 import os
 import shutil
 import stat
@@ -72,6 +73,30 @@ class PrivilegeBackend(ABC):
     def exists(self, path: str) -> bool:
         ...
 
+    # --- path enumeration ----------------------------------------------
+    #
+    # The engine must never call `glob`/`os.walk` itself: on the ADB and root
+    # tiers this process cannot see the paths it is asked to clean, so a local
+    # enumeration would silently report 0 B. Each backend answers these in the
+    # namespace it can actually reach.
+
+    def expand(self, pattern: str) -> list[str]:
+        """Return paths matching ``pattern`` as this backend sees them."""
+        return sorted(glob.glob(pattern, recursive=True))
+
+    def leaves(self, path: str) -> list[str]:
+        """Deletable entries under ``path``; never ``path`` itself."""
+        return _iter_leaves(path)
+
+    def is_dir(self, path: str) -> bool:
+        return os.path.isdir(path) and not os.path.islink(path)
+
+    def is_file(self, path: str) -> bool:
+        return os.path.isfile(path)
+
+    def size(self, path: str) -> int:
+        return os.path.getsize(path)
+
     # --- packages ------------------------------------------------------
     def clear_app_cache(self, package: str, force_stop: bool = True) -> Stats:
         """Clear one app's cache through Android, not by touching files."""
@@ -125,6 +150,45 @@ def _tree_stats(path: str) -> Stats:
     return stats
 
 
+def _iter_leaves(path: str) -> list[str]:
+    """Return deletable leaves under ``path`` (never the root dir itself)."""
+    if os.path.islink(path) or not os.path.isdir(path):
+        return [path]
+    leaves: list[str] = []
+    for root, dirs, files in os.walk(path, topdown=False, followlinks=False):
+        for name in files:
+            leaves.append(os.path.join(root, name))
+        for name in dirs:
+            child = os.path.join(root, name)
+            if os.path.islink(child):
+                leaves.append(child)
+                continue
+            try:
+                if not os.listdir(child):
+                    leaves.append(child)
+            except OSError:
+                continue
+    return leaves
+
+
+def _find_base_and_glob(pattern: str) -> tuple[str, str]:
+    """Split a glob pattern into a `find` start dir and a `-path` glob.
+
+    ``find``'s ``*`` already crosses ``/``, so ``**`` is folded to ``*``; that
+    keeps recursive patterns working on Android's toybox ``find``, which has no
+    ``globstar``.
+    """
+    first_wild = min(
+        (i for i in (pattern.find("*"), pattern.find("?"), pattern.find("[")) if i >= 0),
+        default=-1,
+    )
+    if first_wild < 0:
+        return os.path.dirname(pattern) or "/", pattern
+    cut = pattern.rfind("/", 0, first_wild)
+    base = pattern[:cut] if cut > 0 else "/"
+    return base, pattern.replace("**", "*")
+
+
 def _local_delete(path: str) -> Stats:
     st = os.lstat(path)
     if stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode):
@@ -151,7 +215,12 @@ def _validate_package(package: str) -> str:
 
 
 class _ShellMixin:
-    """Package operations shared by the shell-based backends."""
+    """Package operations shared by the shell-based backends.
+
+    Also implements path enumeration through the shell: a backend that reaches
+    other apps' data cannot see those paths from this process, so `glob` and
+    `os.walk` here would return nothing.
+    """
 
     supports_packages = True
 
@@ -160,6 +229,64 @@ class _ShellMixin:
 
     def _shell_ok(self, command: str) -> str:
         return self._shell(command)
+
+    def _run_raw(self, command: str) -> tuple[int, str, str]:  # pragma: no cover
+        """Run a command whose non-zero exit is expected (probes)."""
+        raise NotImplementedError
+
+    # -- path enumeration -----------------------------------------------
+    def expand(self, pattern: str) -> list[str]:
+        """Return paths matching ``pattern`` as the shell sees them.
+
+        Android's toybox ``find`` has no ``globstar``, so ``**`` is folded to
+        ``*`` (find's ``*`` already crosses ``/``). A non-zero exit is not an
+        error: a pattern whose base directory is missing simply matches
+        nothing.
+        """
+        base, glob_pattern = _find_base_and_glob(pattern)
+        code, out, _ = self._run_raw(
+            f"test -d {shell_quote(base)} && "
+            f"find {shell_quote(base)} -path {shell_quote(glob_pattern)}"
+        )
+        if code != 0:
+            return []
+        return sorted(line for line in out.splitlines() if line.strip())
+
+    def leaves(self, path: str) -> list[str]:
+        """Deletable entries under ``path`` as the shell sees them."""
+        if self.is_file(path) and not self.is_dir(path):
+            return [path]
+        code, out, _ = self._run_raw(
+            f"find {shell_quote(path)} -mindepth 1 \\( -type f -o -type l \\)"
+        )
+        if code != 0:
+            return []
+        return [line for line in out.splitlines() if line.strip()]
+
+    def is_dir(self, path: str) -> bool:
+        code, _, _ = self._run_raw(f"test -d {shell_quote(path)}")
+        return code == 0
+
+    def is_file(self, path: str) -> bool:
+        code, _, _ = self._run_raw(f"test -f {shell_quote(path)}")
+        return code == 0
+
+    def size(self, path: str) -> int:
+        code, out, _ = self._run_raw(f"stat -c %s -- {shell_quote(path)}")
+        if code != 0:
+            raise BackendError(f"cannot stat {path}")
+        try:
+            return int(out.strip().splitlines()[0])
+        except (IndexError, ValueError) as exc:
+            raise BackendError(f"cannot parse stat output: {out!r}") from exc
+
+    def count_leaves(self, path: str) -> Stats:
+        """Count the files under ``path`` as the shell sees them.
+
+        ``measure()`` returns bytes only (one ``du`` call). The delete paths
+        also report *how many* files went away, so they need a count too.
+        """
+        return Stats(files=len(self.leaves(path)), bytes=0)
 
     def clear_app_cache(self, package: str, force_stop: bool = True) -> Stats:
         pkg = _validate_package(package)
@@ -296,11 +423,23 @@ class AdbBackend(_SqliteMixin, _ShellMixin, PrivilegeBackend):
             raise BackendError(f"unsafe path: {path}")
         return path
 
+    def _run_raw(self, command: str) -> tuple[int, str, str]:
+        return self._runner.run(command)
+
     def _shell(self, command: str) -> str:
         code, out, err = self._runner.run(command)
         if code != 0:
             raise BackendError(f"sh exit {code}: {err.strip() or out.strip()}")
         return out
+
+    def expand(self, pattern: str) -> list[str]:
+        """Guard the whole pattern first, then let the shell glob it.
+
+        The pattern itself may contain wildcards, so only the base directory is
+        checked for ``..``; the guard is a smell test, not a sandbox.
+        """
+        self._guarded(pattern)
+        return _ShellMixin.expand(self, pattern)
 
     def measure(self, path: str) -> Stats:
         out = self._shell(f"du -sb -- {shell_quote(self._guarded(path))}")
@@ -313,8 +452,9 @@ class AdbBackend(_SqliteMixin, _ShellMixin, PrivilegeBackend):
     def delete(self, path: str) -> Stats:
         target = self._guarded(path)
         before = self.measure(target).bytes
+        counted = self.count_leaves(target).files
         self._shell(f"rm -rf -- {shell_quote(target)}")
-        return Stats(files=0, bytes=before)
+        return Stats(files=counted, bytes=before)
 
     def exists(self, path: str) -> bool:
         code, _, _ = self._runner.run(f"test -e {shell_quote(self._guarded(path))}")
@@ -355,8 +495,9 @@ class RootBackend(_ShellMixin, PrivilegeBackend):
         if self._runner is None:
             return _local_delete(path)
         before = self.measure(path).bytes
+        counted = self.count_leaves(path).files
         self._shell(f"rm -rf -- {shell_quote(path)}")
-        return Stats(files=0, bytes=before)
+        return Stats(files=counted, bytes=before)
 
     def exists(self, path: str) -> bool:
         if self._runner is None:
@@ -365,6 +506,11 @@ class RootBackend(_ShellMixin, PrivilegeBackend):
         return code == 0
 
     # -- package ops ----------------------------------------------------
+    def _run_raw(self, command: str) -> tuple[int, str, str]:
+        if self._runner is None:
+            raise BackendError("root backend without su runner cannot run shell commands")
+        return self._runner.run(f"su -c {shell_quote(command)}")
+
     def _shell(self, command: str) -> str:
         if self._runner is None:
             raise BackendError("root backend without su runner cannot run shell commands")

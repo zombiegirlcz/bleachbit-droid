@@ -18,8 +18,6 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-import glob
-import os
 import re
 
 from .backends import BackendError, PrivilegeBackend
@@ -62,29 +60,14 @@ def expand_pattern(pattern: str, roots: dict[str, str]) -> str:
     return re.sub(r"/{2,}", "/", expanded)
 
 
-def _glob(pattern: str) -> list[str]:
-    return sorted(glob.glob(pattern, recursive=True))
+def _glob(backend: PrivilegeBackend, pattern: str) -> list[str]:
+    """Match ``pattern`` in the backend's namespace, not this process's."""
+    return backend.expand(pattern)
 
 
-def _iter_leaves(path: str) -> list[str]:
+def _iter_leaves(backend: PrivilegeBackend, path: str) -> list[str]:
     """Return deletable leaves under ``path`` (never the root dir itself)."""
-    if os.path.islink(path) or not os.path.isdir(path):
-        return [path]
-    leaves: list[str] = []
-    for root, dirs, files in os.walk(path, topdown=False, followlinks=False):
-        for name in files:
-            leaves.append(os.path.join(root, name))
-        for name in dirs:
-            child = os.path.join(root, name)
-            if os.path.islink(child):
-                leaves.append(child)
-                continue
-            try:
-                if not os.listdir(child):
-                    leaves.append(child)
-            except OSError:
-                continue
-    return leaves
+    return backend.leaves(path)
 
 
 # ---------------------------------------------------------------------------
@@ -181,13 +164,16 @@ def scan(
                         )
                     )
                     continue
-                for match in _glob(pattern):
-                    if not backend.exists(match) or not os.path.isfile(match):
+                for match in _glob(backend, pattern):
+                    if not backend.exists(match) or not backend.is_file(match):
                         continue
                     if match in seen:
                         continue
                     seen.add(match)
-                    size = os.path.getsize(match)
+                    try:
+                        size = backend.size(match)
+                    except (BackendError, OSError):
+                        continue
                     report.entries.append(
                         Entry(
                             cleaner=spec.name,
@@ -267,10 +253,10 @@ def scan(
                 )
                 continue
 
-            for match in _glob(pattern):
+            for match in _glob(backend, pattern):
                 if not backend.exists(match):
                     continue
-                for leaf in _iter_leaves(match):
+                for leaf in _iter_leaves(backend, match):
                     if leaf in seen:
                         continue
                     try:
@@ -295,7 +281,7 @@ def scan(
                             cleaner=spec.name,
                             path=leaf,
                             size=stats.bytes,
-                            is_dir=os.path.isdir(leaf) and not os.path.islink(leaf),
+                            is_dir=backend.is_dir(leaf),
                             requires=target.requires,
                         )
                     )
