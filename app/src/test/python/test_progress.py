@@ -155,3 +155,50 @@ def test_engine_scan_emits_progress_events(tree: Path, roots: dict[str, str]):
     # running totals must be monotonic
     totals = [e["total_bytes"] for e in found]
     assert totals == sorted(totals)
+
+class CallableProxyWithOnEvent:
+    """Mimics a Chaquopy proxy: it *is* callable and also has ``onEvent``.
+
+    This is the shape that broke progress. `_as_callback()` used to test
+    `callable(value)` first, so it handed the proxy straight to the engine.
+    Calling the proxy does not reach `onEvent(String)`; it raises, and because
+    progress reporting is best-effort the exception was swallowed and every
+    event was lost — the scan worked and the panel stayed empty.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+        self.called_directly = False
+
+    def __call__(self, *args, **kwargs):  # noqa: D105
+        self.called_directly = True
+        raise TypeError("proxy is not directly callable")
+
+    def onEvent(self, json_text: str) -> None:  # noqa: N802 - Java naming
+        self.events.append(json.loads(json_text))
+
+
+def test_as_callback_prefers_onEvent_over_call(roots, tree: Path):
+    proxy = CallableProxyWithOnEvent()
+    assert callable(proxy)  # the trap: this used to short-circuit
+
+    payload = json.dumps({"mode": "nonroot", "cleaners": ["app_cache"], **roots})
+    out = json.loads(api.scan_streaming(payload, proxy))
+
+    assert "error" not in out, out
+    assert proxy.called_directly is False, "proxy was called instead of onEvent()"
+    types = [e["type"] for e in proxy.events]
+    assert "scan_start" in types and "scan_done" in types
+    assert types.count("found") == 2
+
+
+def test_as_callback_falls_back_to_plain_callable():
+    """A real Python callable has no onEvent and must still work."""
+    seen = []
+
+    def cb(event):
+        seen.append(event)
+
+    fn = api._as_callback(cb)
+    fn({"type": "x"})
+    assert seen == [{"type": "x"}]

@@ -264,12 +264,27 @@ def _streaming(fn: Callable[[dict[str, Any], Any], Any]) -> Callable[..., str]:
 def _as_callback(value):
     """Wrap a Kotlin object exposing ``onEvent(String)`` as a Python callable.
 
-    Chaquopy passes Java objects into Python as ``PyObject``. Calling
-    ``callAttr`` on it from a worker thread is safe, and exceptions are
-    swallowed because progress reporting must never abort a clean.
+    Order matters. A Chaquopy proxy *is* ``callable()`` — it forwards
+    ``__call__`` — but calling it does **not** reach ``onEvent(String)``; it
+    raises, and because progress reporting is best-effort the exception is
+    swallowed and every event is silently lost. That is exactly why the
+    progress panel stayed empty after the callback started arriving as a real
+    object instead of a string.
+
+    So look for ``onEvent`` first and only fall back to ``__call__`` for plain
+    Python callables (tests). The ``callAttr`` branch is the last resort for
+    proxies that expose neither attribute nor are callable.
     """
     if value is None:
         return None
+
+    on_event = getattr(value, "onEvent", None)
+    if on_event is not None and callable(on_event):
+        def invoke(event: dict) -> None:
+            on_event(json.dumps(event, ensure_ascii=False))
+
+        return invoke
+
     if callable(value):
         return value
 
