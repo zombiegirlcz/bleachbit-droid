@@ -271,12 +271,31 @@ def apply_clean_streaming(data: dict[str, Any]) -> dict[str, Any]:
     return report.to_dict()
 
 
+@_safe
+def scan_streaming(data: dict[str, Any]) -> dict[str, Any]:
+    """Like ``scan`` but forwards every step to ``data["callback"]``.
+
+    A scan over a shell backend can take seconds per cleaner; without progress
+    the UI looks frozen. The callback receives JSON strings, one per step.
+    """
+    backend = _backend(data)
+    report = engine.scan(
+        backend,
+        _roots(data),
+        _as_list(data.get("cleaners")),
+        _as_list(data.get("unused_packages")),
+        _as_callback(data.get("callback")),
+    )
+    return report.to_dict()
+
+
 __all__ = [
     "apply_clean",
     "apply_clean_streaming",
     "detect",
     "list_cleaners",
     "scan",
+    "scan_streaming",
     "set_adb_runner",
     "set_root_runner",
     "set_vacuum_runner",

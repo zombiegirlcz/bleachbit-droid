@@ -207,6 +207,10 @@ def test_engine_scan_enumerates_through_the_backend(tmp_path: Path):
             calls.append("leaves")
             return real.leaves(path)
 
+        def list_sized(self, pattern):
+            calls.append("list_sized")
+            return real.list_sized(pattern)
+
         def exists(self, path):
             return real.exists(path)
 

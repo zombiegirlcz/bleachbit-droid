@@ -2,117 +2,73 @@ package cz.zombie.bleachbitdroid
 
 import android.content.pm.PackageManager
 import android.util.Log
-import org.json.JSONObject
 import rikka.shizuku.Shizuku
-import java.io.InputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
-Describe the purpose of the class.
-*/
+ * Executes shell commands as the `shell` user (uid 2000) through Shizuku.
+ *
+ * The process is created once and kept alive by [ShellSession]: creating a
+ * Shizuku process per command cost a binder round trip each time and made a
+ * scan crawl. One remote `sh` now serves the whole session.
+ *
+ * [waitForExit] exists because `Process.waitFor(timeout, unit)` polls
+ * `exitValue()`, and `ShizukuRemoteProcess.exitValue()` throws
+ * `IllegalArgumentException: process hasn't exited` while the process is still
+ * running. That made every command fail with exit code -1.
+ */
 class ShizukuRunner : ShellRunner {
 
-    override fun run(command: String): String {
-        val result = JSONObject()
-        var process: Process? = null
-        return try {
-            process = newProcess(arrayOf("sh", "-c", command))
-            val stdout = StringBuilder()
-            val stderr = StringBuilder()
-            val outThread = drain(process.inputStream, stdout)
-            val errThread = drain(process.errorStream, stderr)
-            val finished = waitForExit(process, TIMEOUT_SEC)
-            if (!finished) {
-                process.destroyForcibly()
-                outThread.join(1000)
-                errThread.join(1000)
-                Log.w(TAG, "shizuku exec timed out: $command")
-                result.put("code", -1)
-                result.put("stdout", stdout.toString())
-                result.put("stderr", "timeout")
-                return result.toString()
-            }
-            outThread.join(2000)
-            errThread.join(2000)
-            result.put("code", process.exitValue())
-            result.put("stdout", stdout.toString())
-            result.put("stderr", stderr.toString())
-            result.toString()
-        } catch (t: Throwable) {
-            process?.destroyForcibly()
-            Log.w(TAG, "shizuku exec failed: $command", t)
-            result.put("code", -1)
-            result.put("stdout", "")
-            result.put("stderr", t.message ?: t.javaClass.simpleName)
-            result.toString()
-        }
-    }
-
-    /**
-     * Wait for [process] to exit, bounded by [seconds].
-     *
-     * `Process.waitFor(timeout, unit)` cannot be used here: the default
-     * implementation polls `exitValue()`, and `ShizukuRemoteProcess.exitValue()`
-     * throws `IllegalArgumentException: process hasn't exited` instead of
-     * reporting that the process is still running. That made every Shizuku
-     * command fail with exit code -1, so the ADB tier never appeared.
-     *
-     * `waitFor()` (no timeout) is a blocking binder call and is safe; run it on
-     * a throwaway thread so we can still give up after [seconds].
-     */
-    private fun waitForExit(process: Process, seconds: Long): Boolean {
-        val done = CountDownLatch(1)
-        val waiter = Thread {
-            try {
-                process.waitFor()
-            } catch (_: Throwable) {
-                // process died or the binder went away
-            } finally {
-                done.countDown()
-            }
-        }
-        waiter.isDaemon = true
-        waiter.start()
-        return done.await(seconds, TimeUnit.SECONDS)
-    }
-
-    private fun newProcess(cmd: Array<String>): Process {
-        val method = Shizuku::class.java.getDeclaredMethod(
-            "newProcess",
-            Array<String>::class.java,
-            Array<String>::class.java,
-            String::class.java,
-        )
-        method.isAccessible = true
-        return method.invoke(null, cmd, null, null) as Process
-    }
+    override fun run(command: String): String = session.exec(command).toJson()
 
     companion object {
         private const val TAG = "ShizukuRunner"
         const val REQUEST_CODE = 421
 
         /** Upper bound for one shell command. */
-        private const val TIMEOUT_SEC = 60L
+        private const val TIMEOUT_SEC = 120L
 
-        private fun drain(stream: InputStream, sink: StringBuilder): Thread {
-            val t = Thread {
+        private val session = ShellSession(TAG) {
+            // Plain `sh` reading from stdin: it executes commands as they arrive
+            // and, unlike a `while read` loop, understands multi-line constructs
+            // (`{ cmd\n} 2>&1; echo marker:$?`), which the session protocol uses.
+            newProcess(arrayOf("sh"))
+        }
+
+        fun reset() = session.close()
+
+        /**
+         * Wait for [process] to exit, bounded by [seconds].
+         *
+         * See the class comment: a timeout-based `waitFor` cannot be used with
+         * a Shizuku remote process.
+         */
+        private fun waitForExit(process: Process, seconds: Long): Boolean {
+            val done = CountDownLatch(1)
+            val waiter = Thread {
                 try {
-                    stream.bufferedReader().use { reader ->
-                        val buf = CharArray(4096)
-                        while (true) {
-                            val n = reader.read(buf)
-                            if (n < 0) break
-                            synchronized(sink) { sink.append(buf, 0, n) }
-                        }
-                    }
+                    process.waitFor()
                 } catch (_: Throwable) {
-                    // process died or stream closed
+                    // process died or the binder went away
+                } finally {
+                    done.countDown()
                 }
             }
-            t.isDaemon = true
-            t.start()
-            return t
+            waiter.isDaemon = true
+            waiter.start()
+            return done.await(seconds, TimeUnit.SECONDS)
+        }
+
+        private fun newProcess(cmd: Array<String>): Process {
+            val method = Shizuku::class.java.getDeclaredMethod(
+                "newProcess",
+                Array<String>::class.java,
+                Array<String>::class.java,
+                String::class.java,
+            )
+            method.isAccessible = true
+            return method.invoke(null, cmd, null, null) as Process
         }
 
         private val binderReceived = Shizuku.OnBinderReceivedListener {
@@ -121,12 +77,12 @@ class ShizukuRunner : ShellRunner {
         }
         private val binderDead = Shizuku.OnBinderDeadListener {
             Log.i(TAG, "shizuku binder dead")
+            reset()
             onBinderChanged?.invoke()
         }
         private val permissionResult = Shizuku.OnRequestPermissionResultListener { code, grant ->
             if (code == REQUEST_CODE) {
-                Log.i(TAG,
-                        "shizuku permission result: $grant")
+                Log.i(TAG, "shizuku permission result: $grant")
                 onBinderChanged?.invoke()
             }
         }
@@ -165,8 +121,7 @@ class ShizukuRunner : ShellRunner {
                     Shizuku.requestPermission(REQUEST_CODE)
                 }
             } catch (t: Throwable) {
-                Log.w(TAG,
-                        "shizuku permission request failed", t)
+                Log.w(TAG, "shizuku permission request failed", t)
             }
         }
     }

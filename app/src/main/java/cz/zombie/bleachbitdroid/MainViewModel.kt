@@ -27,6 +27,10 @@ data class UiState(
     val error: String? = null,
     val usageAccessGranted: Boolean = false,
     val allFilesAccess: Boolean = false,
+    /** Live progress lines, newest last; capped so the UI never grows forever. */
+    val progress: List<String> = emptyList(),
+    /** Current cleaner being scanned/cleaned, for the header. */
+    val progressTitle: String? = null,
 ) {
     val selectedCleaners: List<String>
         get() = cleaners.filter { it.name in selected && it.enabled }.map { it.name }
@@ -52,6 +56,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private companion object {
         const val TAG = "MainViewModel"
+
+        /** Enough history to see what happened, small enough to not choke UI. */
+        const val MAX_PROGRESS_LINES = 200
     }
 
     private val _state = MutableStateFlow(UiState())
@@ -234,20 +241,48 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         return withContext(Dispatchers.IO) { UsageStatsProvider.unusedPackages(context, days) }
     }
 
+    private fun pushProgress(event: ProgressEvent) {
+        val line = event.render()
+        val title = when (event.type) {
+            "cleaner_start" -> event.description.ifEmpty { event.cleaner }
+            "cleaner_done" -> null
+            else -> null
+        }
+        _state.update { current ->
+            val lines = (current.progress + line).takeLast(MAX_PROGRESS_LINES)
+            current.copy(
+                progress = lines,
+                progressTitle = title ?: current.progressTitle,
+            )
+        }
+    }
+
     fun scan() {
         viewModelScope.launch {
             val current = _state.value
             _state.update {
-                it.copy(phase = Phase.SCANNING, error = null, message = null, clean = null)
+                it.copy(
+                    phase = Phase.SCANNING,
+                    error = null,
+                    message = null,
+                    clean = null,
+                    progress = emptyList(),
+                    progressTitle = null,
+                )
             }
             try {
                 val unused = unusedPackagesFor(current.selectedCleaners)
                 val summary = CleanerRepository.scan(
                     context, current.mode, current.selectedCleaners, unused,
+                    onProgress = { pushProgress(it) },
                 )
-                _state.update { it.copy(phase = Phase.IDLE, scan = summary) }
+                _state.update {
+                    it.copy(phase = Phase.IDLE, scan = summary, progressTitle = null)
+                }
             } catch (t: Throwable) {
-                _state.update { it.copy(phase = Phase.IDLE, error = t.message) }
+                _state.update {
+                    it.copy(phase = Phase.IDLE, error = t.message, progressTitle = null)
+                }
             }
         }
     }
@@ -255,16 +290,26 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun clean(dryRun: Boolean) {
         viewModelScope.launch {
             val current = _state.value
-            _state.update { it.copy(phase = Phase.CLEANING, error = null, message = null) }
+            _state.update {
+                it.copy(
+                    phase = Phase.CLEANING,
+                    error = null,
+                    message = null,
+                    progress = emptyList(),
+                    progressTitle = null,
+                )
+            }
             try {
                 val unused = unusedPackagesFor(current.selectedCleaners)
                 val summary = CleanerRepository.apply(
                     context, current.mode, current.selectedCleaners, dryRun, unused,
+                    onProgress = { pushProgress(it) },
                 )
                 _state.update {
                     it.copy(
                         phase = Phase.IDLE,
                         clean = summary,
+                        progressTitle = null,
                         message = if (dryRun) {
                             "Zkušební režim: uvolnilo by se ${formatBytes(summary.freedBytes)}"
                         } else {
@@ -273,7 +318,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     )
                 }
             } catch (t: Throwable) {
-                _state.update { it.copy(phase = Phase.IDLE, error = t.message) }
+                _state.update {
+                    it.copy(phase = Phase.IDLE, error = t.message, progressTitle = null)
+                }
             }
         }
     }

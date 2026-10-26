@@ -85,8 +85,12 @@ object CleanerRepository {
         mode: PrivilegeMode,
         cleaners: List<String>,
         unusedPackages: List<String>? = null,
+        onProgress: ((ProgressEvent) -> Unit)? = null,
     ): ScanSummary = withContext(Dispatchers.Default) {
-        val json = PythonBridge.scan(context, mode.id, cleaners, unusedPackages)
+        val sink = ProgressSink { onProgress?.invoke(it) }
+        val json = PythonBridge.scanStreaming(
+            context, mode.id, cleaners, unusedPackages, sink,
+        )
         json.optString("error").takeIf { it.isNotEmpty() }?.let { error(it) }
 
         val perCleaner = mutableMapOf<String, Long>()
@@ -111,8 +115,12 @@ object CleanerRepository {
         cleaners: List<String>,
         dryRun: Boolean,
         unusedPackages: List<String>? = null,
+        onProgress: ((ProgressEvent) -> Unit)? = null,
     ): CleanSummary = withContext(Dispatchers.Default) {
-        val json = PythonBridge.applyClean(context, mode.id, cleaners, dryRun, unusedPackages)
+        val sink = ProgressSink { onProgress?.invoke(it) }
+        val json = PythonBridge.applyCleanStreaming(
+            context, mode.id, cleaners, dryRun, unusedPackages, sink,
+        )
         json.optString("error").takeIf { it.isNotEmpty() }?.let { error(it) }
 
         val lines = mutableListOf<String>()

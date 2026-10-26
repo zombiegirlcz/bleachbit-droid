@@ -82,6 +82,32 @@ object PythonBridge {
         if (unusedPackages != null) put("unused_packages", JSONArray(unusedPackages))
     }.toString())
 
+    fun scanStreaming(
+        context: Context,
+        mode: String,
+        cleaners: List<String>,
+        unusedPackages: List<String>? = null,
+        sink: ProgressSink,
+    ): JSONObject = call("scan_streaming", basePayload(context, mode).apply {
+        put("cleaners", JSONArray(cleaners))
+        if (unusedPackages != null) put("unused_packages", JSONArray(unusedPackages))
+        put("callback", sink)
+    }.toString())
+
+    fun applyCleanStreaming(
+        context: Context,
+        mode: String,
+        cleaners: List<String>,
+        dryRun: Boolean,
+        unusedPackages: List<String>? = null,
+        sink: ProgressSink,
+    ): JSONObject = call("apply_clean_streaming", basePayload(context, mode).apply {
+        put("cleaners", JSONArray(cleaners))
+        put("dry_run", dryRun)
+        if (unusedPackages != null) put("unused_packages", JSONArray(unusedPackages))
+        put("callback", sink)
+    }.toString())
+
     fun applyClean(
         context: Context,
         mode: String,

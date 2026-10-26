@@ -97,6 +97,27 @@ class PrivilegeBackend(ABC):
     def size(self, path: str) -> int:
         return os.path.getsize(path)
 
+    def list_sized(self, pattern: str) -> list[tuple[str, int]]:
+        """Files matching ``pattern`` with their sizes, in one pass.
+
+        This is what ``engine.scan`` uses. The obvious alternative — expand the
+        pattern, walk every match, then ``stat`` each leaf — costs one round
+        trip per file, which on a shell backend (Shizuku/`su`) means a process
+        per file and a scan that takes minutes.
+        """
+        out: list[tuple[str, int]] = []
+        seen: set[str] = set()
+        for match in self.expand(pattern):
+            for leaf in self.leaves(match):
+                if leaf in seen:
+                    continue
+                seen.add(leaf)
+                try:
+                    out.append((leaf, self.size(leaf)))
+                except (BackendError, OSError):
+                    continue
+        return out
+
     # --- packages ------------------------------------------------------
     def clear_app_cache(self, package: str, force_stop: bool = True) -> Stats:
         """Clear one app's cache through Android, not by touching files."""
@@ -279,6 +300,41 @@ class _ShellMixin:
             return int(out.strip().splitlines()[0])
         except (IndexError, ValueError) as exc:
             raise BackendError(f"cannot parse stat output: {out!r}") from exc
+
+    def list_sized(self, pattern: str) -> list[tuple[str, int]]:
+        """One ``find`` + ``stat`` for the whole pattern.
+
+        ``-path`` matches both files that match the glob and everything under a
+        directory that matches it (find's ``*`` crosses ``/``), so a single
+        command covers the whole cleaner target. ``-exec ... +`` batches the
+        stats instead of spawning one process per file.
+        """
+        base, glob_pattern = _find_base_and_glob(pattern)
+        nested = glob_pattern.rstrip("/") + "/*"
+        code, out, _ = self._run_raw(
+            f"test -d {shell_quote(base)} && "
+            f"find {shell_quote(base)} "
+            f"\\( -path {shell_quote(glob_pattern)} -o -path {shell_quote(nested)} \\) "
+            f"\\( -type f -o -type l \\) "
+            f"-exec stat -c '%s\\t%n' {{}} +"
+        )
+        if code != 0:
+            return []
+        result: list[tuple[str, int]] = []
+        seen: set[str] = set()
+        for line in out.splitlines():
+            if "\t" not in line:
+                continue
+            size_text, path = line.split("\t", 1)
+            try:
+                size = int(size_text)
+            except ValueError:
+                continue
+            if path in seen:
+                continue
+            seen.add(path)
+            result.append((path, size))
+        return result
 
     def count_leaves(self, path: str) -> Stats:
         """Count the files under ``path`` as the shell sees them.

@@ -17,57 +17,36 @@ import java.util.concurrent.TimeUnit
  *     `inputStream.readText()` blocks until EOF, which never comes while `su`
  *     sits on a prompt, so reading first made the timeout unreachable and hung
  *     app startup forever.
+ *
+ * Since the shell session rewrite, commands are NOT run by spawning `su` each
+ * time: [session] keeps one `su` process alive and feeds commands to its stdin.
+ * Spawning a new `su` per command produced a Magisk prompt for every `test -e`
+ * and `stat` during a scan and buried the screen in dialogs.
  */
 class RootRunner : ShellRunner {
 
-    override fun run(command: String): String {
-        val result = JSONObject()
-        var process: Process? = null
-        return try {
-            process = Runtime.getRuntime().exec("su")
-            DataOutputStream(process.outputStream).use { stdin ->
-                stdin.writeBytes(command + "\n")
-                stdin.writeBytes("exit\n")
-                stdin.flush()
-            }
-
-            val stdout = StringBuilder()
-            val stderr = StringBuilder()
-            val outThread = drain(process.inputStream, stdout)
-            val errThread = drain(process.errorStream, stderr)
-
-            val finished = process.waitFor(EXEC_TIMEOUT_SEC, TimeUnit.SECONDS)
-            if (!finished) {
-                process.destroyForcibly()
-                outThread.join(1000)
-                errThread.join(1000)
-                result.put("code", -1)
-                result.put("stdout", stdout.toString())
-                result.put("stderr", "timeout waiting for su")
-                return result.toString()
-            }
-            outThread.join(2000)
-            errThread.join(2000)
-            result.put("code", process.exitValue())
-            result.put("stdout", stdout.toString())
-            result.put("stderr", stderr.toString())
-            result.toString()
-        } catch (t: Throwable) {
-            process?.destroyForcibly()
-            Log.w(TAG, "su exec failed", t)
-            result.put("code", -1)
-            result.put("stdout", "")
-            result.put("stderr", t.message ?: t.javaClass.simpleName)
-            result.toString()
-        }
-    }
+    override fun run(command: String): String = session.exec(command).toJson()
 
     companion object {
         private const val TAG = "RootRunner"
 
         /** Short: a pending Magisk prompt must not block startup. */
         private const val PROBE_TIMEOUT_SEC = 5L
-        private const val EXEC_TIMEOUT_SEC = 120L
+
+        /** The one persistent root shell, shared by every backend call. */
+        private val session = ShellSession(TAG) {
+            val process = Runtime.getRuntime().exec("su")
+            // `su` reads commands from stdin; keep the stream open for the
+            // whole session instead of writing `exit` after every command.
+            DataOutputStream(process.outputStream).let { stdin ->
+                stdin.writeBytes("echo __BB_READY__\n")
+                stdin.flush()
+            }
+            process
+        }
+
+        /** Drop the shell (e.g. after the user revoked root). */
+        fun reset() = session.close()
 
         private fun drain(stream: InputStream, sink: StringBuilder): Thread {
             val t = Thread {
@@ -92,15 +71,27 @@ class RootRunner : ShellRunner {
         /**
          * True when `su` exists and grants uid 0. Blocking, but bounded.
          *
-         * Streams are drained in the background: `readText()` here would block
-         * on a Magisk prompt forever and defeat the timeout.
+         * Reuses the persistent session so the probe does not itself trigger a
+         * prompt when root was already granted.
          */
         fun isAvailable(): Boolean {
+            val r = session.exec("id", PROBE_TIMEOUT_SEC)
+            if (r.code != 0) {
+                session.close()
+                Log.i(TAG, "su probe failed: ${r.stderr.ifEmpty { r.stdout }}")
+                return false
+            }
+            return r.stdout.contains("uid=0")
+        }
+
+        /** Kept for callers that need a one-shot root check with `su -c`. */
+        internal fun oneShot(command: String): String {
             var process: Process? = null
+            val result = JSONObject()
             return try {
                 process = Runtime.getRuntime().exec("su")
                 DataOutputStream(process.outputStream).use { stdin ->
-                    stdin.writeBytes("id\n")
+                    stdin.writeBytes(command + "\n")
                     stdin.writeBytes("exit\n")
                     stdin.flush()
                 }
@@ -109,16 +100,22 @@ class RootRunner : ShellRunner {
                 val finished = process.waitFor(PROBE_TIMEOUT_SEC, TimeUnit.SECONDS)
                 if (!finished) {
                     process.destroyForcibly()
-                    Log.i(TAG, "su probe timed out (Magisk prompt pending?)")
-                    false
+                    result.put("code", -1)
+                    result.put("stdout", "")
+                    result.put("stderr", "timeout waiting for su")
                 } else {
                     t.join(1000)
-                    val text = synchronized(out) { out.toString() }
-                    text.contains("uid=0")
+                    result.put("code", process.exitValue())
+                    result.put("stdout", synchronized(out) { out.toString() })
+                    result.put("stderr", "")
                 }
+                result.toString()
             } catch (t: Throwable) {
                 process?.destroyForcibly()
-                false
+                result.put("code", -1)
+                result.put("stdout", "")
+                result.put("stderr", t.message ?: t.javaClass.simpleName)
+                result.toString()
             }
         }
     }

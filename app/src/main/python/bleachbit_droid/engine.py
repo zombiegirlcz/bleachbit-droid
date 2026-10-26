@@ -141,11 +141,25 @@ def scan(
     roots: dict[str, str],
     names: list[str] | None = None,
     unused_packages: list[str] | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> ScanReport:
     report = ScanReport(backend=backend.name)
     seen: set[str] = set()
 
-    for spec in select_cleaners(backend, names):
+    def emit(kind: str, **fields: Any) -> None:
+        """Report progress; a failing callback must never abort a scan."""
+        if on_event is None:
+            return
+        try:
+            on_event({"type": kind, **fields})
+        except Exception:  # noqa: BLE001 - progress is best effort
+            pass
+
+    specs = select_cleaners(backend, names)
+    emit("scan_start", backend=backend.name, cleaners=[s.name for s in specs])
+
+    for spec in specs:
+        emit("cleaner_start", cleaner=spec.name, description=spec.description)
         if spec.kind is Kind.SQLITE:
             for target in spec.paths:
                 if not backend.can(target.requires):
@@ -253,48 +267,69 @@ def scan(
                 )
                 continue
 
-            for match in _glob(backend, pattern):
-                if not backend.exists(match):
+            # One bulk pass per target: on the shell backends (Shizuku / su)
+            # every per-file round trip costs a command, so a target with 2000
+            # cache files used to mean 2000 shell calls and a scan that took
+            # minutes. list_sized() asks for the whole target at once.
+            try:
+                sized = backend.list_sized(pattern)
+            except (BackendError, OSError) as exc:
+                report.log.append(
+                    LogRecord(
+                        backend=backend.name,
+                        cleaner=spec.name,
+                        path=pattern,
+                        action=Action.SCAN,
+                        result=Result.FAILED,
+                        reason=str(exc),
+                    )
+                )
+                continue
+
+            for leaf, size in sized:
+                if leaf in seen:
                     continue
-                for leaf in _iter_leaves(backend, match):
-                    if leaf in seen:
-                        continue
-                    try:
-                        stats = backend.measure(leaf)
-                    except (BackendError, OSError) as exc:
-                        report.log.append(
-                            LogRecord(
-                                backend=backend.name,
-                                cleaner=spec.name,
-                                path=leaf,
-                                action=Action.SCAN,
-                                result=Result.FAILED,
-                                reason=str(exc),
-                            )
-                        )
-                        continue
-                    if stats.bytes == 0 and stats.files == 0:
-                        continue
-                    seen.add(leaf)
-                    report.entries.append(
-                        Entry(
-                            cleaner=spec.name,
-                            path=leaf,
-                            size=stats.bytes,
-                            is_dir=backend.is_dir(leaf),
-                            requires=target.requires,
-                        )
+                if size == 0:
+                    continue
+                seen.add(leaf)
+                report.entries.append(
+                    Entry(
+                        cleaner=spec.name,
+                        path=leaf,
+                        size=size,
+                        is_dir=False,
+                        requires=target.requires,
                     )
-                    report.log.append(
-                        LogRecord(
-                            backend=backend.name,
-                            cleaner=spec.name,
-                            path=leaf,
-                            action=Action.SCAN,
-                            bytes=stats.bytes,
-                            result=Result.OK,
-                        )
+                )
+                report.log.append(
+                    LogRecord(
+                        backend=backend.name,
+                        cleaner=spec.name,
+                        path=leaf,
+                        action=Action.SCAN,
+                        bytes=size,
+                        result=Result.OK,
                     )
+                )
+                emit(
+                    "found",
+                    cleaner=spec.name,
+                    path=leaf,
+                    bytes=size,
+                    total_bytes=report.total_bytes,
+                    entries=len(report.entries),
+                )
+        emit(
+            "cleaner_done",
+            cleaner=spec.name,
+            entries=len(report.entries),
+            total_bytes=report.total_bytes,
+        )
+    emit(
+        "scan_done",
+        entries=len(report.entries),
+        total_bytes=report.total_bytes,
+    )
     return report
 
 
