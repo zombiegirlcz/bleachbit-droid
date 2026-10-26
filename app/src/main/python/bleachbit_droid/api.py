@@ -235,6 +235,32 @@ def apply_clean(data: dict[str, Any]) -> dict[str, Any]:
     return report.to_dict()
 
 
+def _streaming(fn: Callable[[dict[str, Any], Any], Any]) -> Callable[..., str]:
+    """Like ``_safe``, but takes a Java callback as a *second argument*.
+
+    The callback cannot travel inside the JSON payload. ``JSONObject.put``
+    would turn the Kotlin object into the string
+    ``cz.zombie.bleachbitdroid.ProgressSink@aee8990`` — which is exactly what
+    happened, and why the progress panel stayed empty while the scan itself
+    worked. Chaquopy has to hand the object over separately.
+    """
+
+    def wrapper(payload: str = "{}", callback: Any = None) -> str:
+        try:
+            data = json.loads(payload) if payload else {}
+            return json.dumps(fn(data, callback), ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001 - boundary must never raise
+            return json.dumps(
+                {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc(limit=5),
+                },
+                ensure_ascii=False,
+            )
+
+    return wrapper
+
+
 def _as_callback(value):
     """Wrap a Kotlin object exposing ``onEvent(String)`` as a Python callable.
 
@@ -253,9 +279,9 @@ def _as_callback(value):
     return invoke
 
 
-@_safe
-def apply_clean_streaming(data: dict[str, Any]) -> dict[str, Any]:
-    """Like ``apply_clean`` but forwards every step to ``data["callback"]``.
+@_streaming
+def apply_clean_streaming(data: dict[str, Any], callback: Any = None) -> dict[str, Any]:
+    """Like ``apply_clean`` but forwards every step to ``callback``.
 
     The callback receives JSON strings; the UI renders them as a live log.
     """
@@ -266,14 +292,14 @@ def apply_clean_streaming(data: dict[str, Any]) -> dict[str, Any]:
         _as_list(data.get("cleaners")),
         bool(data.get("dry_run", True)),
         _as_list(data.get("unused_packages")),
-        _as_callback(data.get("callback")),
+        _as_callback(callback),
     )
     return report.to_dict()
 
 
-@_safe
-def scan_streaming(data: dict[str, Any]) -> dict[str, Any]:
-    """Like ``scan`` but forwards every step to ``data["callback"]``.
+@_streaming
+def scan_streaming(data: dict[str, Any], callback: Any = None) -> dict[str, Any]:
+    """Like ``scan`` but forwards every step to ``callback``.
 
     A scan over a shell backend can take seconds per cleaner; without progress
     the UI looks frozen. The callback receives JSON strings, one per step.
@@ -284,7 +310,7 @@ def scan_streaming(data: dict[str, Any]) -> dict[str, Any]:
         _roots(data),
         _as_list(data.get("cleaners")),
         _as_list(data.get("unused_packages")),
-        _as_callback(data.get("callback")),
+        _as_callback(callback),
     )
     return report.to_dict()
 

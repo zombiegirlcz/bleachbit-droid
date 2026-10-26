@@ -27,9 +27,17 @@ object PythonBridge {
         module = Python.getInstance().getModule("bleachbit_droid.api")
     }
 
-    private fun call(name: String, payload: String): JSONObject {
+    private fun call(name: String, payload: String, extra: Any? = null): JSONObject {
         val mod = module ?: error("PythonBridge.init() not called")
-        val raw = mod.callAttr(name, payload).toString()
+        // The progress callback must be a separate argument: putting a Kotlin
+        // object into the JSON payload makes JSONObject serialise it into the
+        // string "cz.zombie.bleachbitdroid.ProgressSink@1a2b3c", so Python
+        // never received a live object and the progress panel stayed empty.
+        val raw = if (extra == null) {
+            mod.callAttr(name, payload)
+        } else {
+            mod.callAttr(name, payload, extra)
+        }.toString()
         // Full payload goes to logcat: the UI only shows `error`, but the
         // Python side also returns a `traceback` field we need for debugging.
         Log.d(TAG, "$name <- $payload")
@@ -91,8 +99,7 @@ object PythonBridge {
     ): JSONObject = call("scan_streaming", basePayload(context, mode).apply {
         put("cleaners", JSONArray(cleaners))
         if (unusedPackages != null) put("unused_packages", JSONArray(unusedPackages))
-        put("callback", sink)
-    }.toString())
+    }.toString(), sink)
 
     fun applyCleanStreaming(
         context: Context,
@@ -105,8 +112,7 @@ object PythonBridge {
         put("cleaners", JSONArray(cleaners))
         put("dry_run", dryRun)
         if (unusedPackages != null) put("unused_packages", JSONArray(unusedPackages))
-        put("callback", sink)
-    }.toString())
+    }.toString(), sink)
 
     fun applyClean(
         context: Context,
