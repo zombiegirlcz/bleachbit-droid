@@ -14,6 +14,10 @@ from Kotlin:
     <sdcard>        -> /sdcard
     <android_data>  -> /data/data
     <android_media> -> /data/media/0
+
+The sizes quoted in descriptions come from a real measurement on the test
+device (Android 13, MIUI) and are there so the risk/reward of a cleaner is
+visible in the UI without running a scan first.
 """
 
 from __future__ import annotations
@@ -48,7 +52,29 @@ CLEANERS: tuple[CleanerSpec, ...] = (
         paths=(
             Target(f"{ANDROID_MEDIA}/DCIM/.thumbnails/**", Capability.SHARED_STORAGE),
             Target(f"{SDCARD}/DCIM/.thumbnails/**", Capability.SHARED_STORAGE),
+        ),
+    ),
+    CleanerSpec(
+        name="external_app_cache",
+        description="Cache aplikací ve sdíleném úložišti",
+        requires=(Capability.SHARED_STORAGE,),
+        risk=Risk.LOW,
+        paths=(
+            # Only the ``cache`` subdirectory. ``/sdcard/Android/data`` as a
+            # whole is 9.7 GB here, but that is game/asset data in ``files/``
+            # (Pokemon Unite alone is 7.8 GB), not disposable cache.
+            Target(f"{ANDROID_MEDIA}/Android/data/*/cache/**", Capability.SHARED_STORAGE),
             Target(f"{SDCARD}/Android/data/*/cache/**", Capability.SHARED_STORAGE),
+        ),
+    ),
+    CleanerSpec(
+        name="shared_databases",
+        description="Databáze ve sdíleném úložišti (VACUUM)",
+        requires=(Capability.SHARED_STORAGE,),
+        risk=Risk.LOW,
+        kind=Kind.SQLITE,
+        paths=(
+            Target(f"{SDCARD}/**/*.db", Capability.SHARED_STORAGE),
         ),
     ),
 
@@ -57,7 +83,7 @@ CLEANERS: tuple[CleanerSpec, ...] = (
     # rm -rf on /data/data/<pkg>/cache (safe against open files).
     CleanerSpec(
         name="other_app_cache",
-        description="Mezipaměť ostatních aplikací",
+        description="Mezipaměť ostatních aplikací (~300 MB)",
         requires=(Capability.OTHER_APP_DATA,),
         risk=Risk.MEDIUM,
         kind=Kind.PACKAGE,
@@ -70,41 +96,6 @@ CLEANERS: tuple[CleanerSpec, ...] = (
         kind=Kind.PACKAGE,
         unused_days=30,
     ),
-
-    # -- root tier -------------------------------------------------------
-    CleanerSpec(
-        name="logcat_dumps",
-        description="Zachycené systémové logy a ANR",
-        requires=(Capability.SYSTEM,),
-        risk=Risk.MEDIUM,
-        paths=(
-            Target("/data/anr/**", Capability.SYSTEM),
-            Target("/data/tombstones/**", Capability.SYSTEM),
-            Target("/data/system/dropbox/**", Capability.SYSTEM),
-        ),
-    ),
-    CleanerSpec(
-        name="dalvik_cache",
-        description="ART/Dalvik cache všech aplikací",
-        requires=(Capability.SYSTEM,),
-        risk=Risk.MEDIUM,
-        paths=(
-            Target(f"{ANDROID_DATA}/*/code_cache/**", Capability.SYSTEM),
-        ),
-    ),
-    CleanerSpec(
-        name="apk_leftovers",
-        description="Zbytky po odinstalovaných aplikacích",
-        requires=(Capability.SYSTEM,),
-        risk=Risk.HIGH,
-        paths=(
-            Target(f"{ANDROID_DATA}/*/lib/**", Capability.SYSTEM),
-        ),
-    ),
-
-    # -- database tier (bundled glibc sqlite3) ---------------------------
-    # DELETE only frees pages inside the file; VACUUM rewrites it so the bytes
-    # actually leave the disk. No Android tool can do this.
     CleanerSpec(
         name="own_databases",
         description="Databáze této aplikace (VACUUM)",
@@ -126,16 +117,91 @@ CLEANERS: tuple[CleanerSpec, ...] = (
             Target(f"{ANDROID_DATA}/*/databases/*.db", Capability.OTHER_APP_DATA),
         ),
     ),
+
+    # -- root tier -------------------------------------------------------
     CleanerSpec(
-        name="shared_databases",
-        description="Databáze ve sdíleném úložišti (VACUUM)",
-        requires=(Capability.SHARED_STORAGE,),
-        risk=Risk.LOW,
-        kind=Kind.SQLITE,
+        name="logcat_dumps",
+        description="Zachycené systémové logy a ANR (~10 MB)",
+        requires=(Capability.SYSTEM,),
+        risk=Risk.MEDIUM,
         paths=(
-            Target(f"{SDCARD}/**/*.db", Capability.SHARED_STORAGE),
+            Target("/data/anr/**", Capability.SYSTEM),
+            Target("/data/tombstones/**", Capability.SYSTEM),
+            Target("/data/system/dropbox/**", Capability.SYSTEM),
         ),
     ),
+    # Measured: /data/dalvik-cache is ~850 MB on this device, by far the
+    # largest reclaimable directory. ART rebuilds the .dex/.oat files on the
+    # next app launch, so deleting them is safe; the engine never removes the
+    # glob root directory itself, only its leaves.
+    CleanerSpec(
+        name="dalvik_cache",
+        description="ART/Dalvik cache všech aplikací (~850 MB)",
+        requires=(Capability.SYSTEM,),
+        risk=Risk.MEDIUM,
+        paths=(
+            Target("/data/dalvik-cache/arm64/**", Capability.SYSTEM),
+            Target("/data/dalvik-cache/arm/**", Capability.SYSTEM),
+        ),
+    ),
+    # Per-app ``code_cache`` is tiny here (~70 kB total) but non-zero, and it
+    # is the directory Android itself considers disposable.
+    CleanerSpec(
+        name="app_code_cache",
+        description="Kódová cache jednotlivých aplikací",
+        requires=(Capability.SYSTEM,),
+        risk=Risk.LOW,
+        paths=(
+            Target(f"{ANDROID_DATA}/*/code_cache/**", Capability.SYSTEM),
+        ),
+    ),
+    CleanerSpec(
+        name="package_cache",
+        description="Cache instalátoru balíčků (~15 MB)",
+        requires=(Capability.SYSTEM,),
+        risk=Risk.LOW,
+        paths=(
+            Target("/data/system/package_cache/**", Capability.SYSTEM),
+        ),
+    ),
+    CleanerSpec(
+        name="profile_snapshots",
+        description="Profily ART/kompilace aplikací (~6 MB)",
+        requires=(Capability.SYSTEM,),
+        risk=Risk.LOW,
+        paths=(
+            Target("/data/misc/profiles/cur/**", Capability.SYSTEM),
+            Target("/data/misc/profiles/ref/**", Capability.SYSTEM),
+        ),
+    ),
+    CleanerSpec(
+        name="system_cache_dir",
+        description="Systémová /cache a resource-cache",
+        requires=(Capability.SYSTEM,),
+        risk=Risk.MEDIUM,
+        paths=(
+            Target("/cache/**", Capability.SYSTEM),
+            Target("/data/resource-cache/**", Capability.SYSTEM),
+        ),
+    ),
+    # /data/local/tmp is a shared scratch directory: 1.5 GB here, but other
+    # tooling puts files there on purpose, so it stays HIGH risk and off by
+    # default in the UI (only cleaners the user selects are run).
+    CleanerSpec(
+        name="staging_tmp",
+        description="Dočasné soubory ve /data/local/tmp (~1,5 GB)",
+        requires=(Capability.SYSTEM,),
+        risk=Risk.HIGH,
+        paths=(
+            Target("/data/local/tmp/**", Capability.SYSTEM),
+        ),
+    ),
+    # NOTE: an earlier ``apk_leftovers`` cleaner globbed
+    # ``<android_data>/*/lib/**`` and claimed to remove leftovers of
+    # uninstalled apps. That pattern actually matches the native libraries of
+    # *installed* apps, so running it would break every app shipping native
+    # code. Leftovers need a real package-list comparison, not a glob, so the
+    # cleaner is gone until that exists.
 )
 
 

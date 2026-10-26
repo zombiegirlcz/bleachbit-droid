@@ -584,6 +584,68 @@ class RootBackend(_SqliteMixin, _ShellMixin, PrivilegeBackend):
         return code == 0
 
     # -- package ops ----------------------------------------------------
+    def package_uid(self, package: str) -> int | None:
+        """Owner uid of ``/data/data/<package>``, or None when it is gone.
+
+        Read from the directory itself rather than parsed out of
+        ``dumpsys package``: one stat, no fragile text parsing, and it also
+        tells us the directory still exists.
+        """
+        code, out, _ = self._run_raw(
+            f"stat -c %u -- {shell_quote('/data/data/' + _validate_package(package))}"
+        )
+        if code != 0:
+            return None
+        try:
+            return int(out.strip().splitlines()[0])
+        except (IndexError, ValueError):
+            return None
+
+    def clear_app_cache(self, package: str, force_stop: bool = True) -> Stats:
+        """Clear one app's cache **as that app's own uid**.
+
+        Why not just ``rm -rf`` as root: a file created by root inside an app's
+        data directory stays owned by root, the app can no longer write it, and
+        the next launch misbehaves (this is the failure mode that caused a
+        bootloop elsewhere in this project). Deleting as the owning uid means
+        every remaining file keeps a consistent owner, and nothing is chowned.
+
+        ``pm clear --cache-only`` is deliberately not used on this tier: it
+        also wipes package-manager bookkeeping, and we can do the narrower,
+        safer thing here.
+        """
+        pkg = _validate_package(package)
+        uid = self.package_uid(pkg)
+        if uid is None:
+            raise BackendError(f"no data directory for {pkg}")
+
+        cache = f"/data/data/{pkg}/cache"
+        before = 0
+        try:
+            out = self._shell(f"du -sk -- {shell_quote(cache)} 2>/dev/null || true")
+            before = int(out.split()[0]) * 1024 if out.strip() else 0
+        except (BackendError, ValueError, IndexError):
+            before = 0
+
+        if force_stop:
+            # Failing here is not fatal: an open cache file may still delete.
+            try:
+                self._shell(f"am force-stop {pkg}")
+            except BackendError:
+                pass
+
+        # -mindepth 1 keeps the cache directory itself; -delete removes files
+        # and empty directories bottom-up. Running through `su <uid>` is the
+        # whole point: the filesystem sees the app's own uid, not root's.
+        code, out, err = self._runner.run(
+            f"su {uid} -c {shell_quote(f'find {cache} -mindepth 1 -delete 2>&1')}"
+        )
+        if code != 0:
+            raise BackendError(
+                f"cannot clear cache of {pkg} as uid {uid}: {err.strip() or out.strip()}"
+            )
+        return Stats(files=0, bytes=before)
+
     def _run_raw(self, command: str) -> tuple[int, str, str]:
         if self._runner is None:
             raise BackendError("root backend without su runner cannot run shell commands")

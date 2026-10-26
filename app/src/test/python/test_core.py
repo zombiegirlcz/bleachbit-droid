@@ -288,12 +288,41 @@ def test_root_backend_uses_su_runner():
     assert all(c.startswith("su -c") for c in shell.calls)
 
 
-def test_root_backend_clear_app_cache_goes_through_su():
-    shell = FakeShell()
+def test_root_backend_clears_cache_as_the_apps_own_uid():
+    """Root must not create root-owned files inside an app's data dir.
+
+    Deleting as root leaves root-owned files behind, the app can no longer
+    write them, and the next launch misbehaves. The cache is therefore cleared
+    through `su <uid>`, so the filesystem sees the app's own uid.
+    """
+    shell = FakeShell({
+        "su -c 'stat": (0, "10316\n", ""),
+        "su -c 'du": (0, "150748\t/data/data/com.example/cache\n", ""),
+        "su -c 'am force-stop": (0, "", ""),
+    })
     backend = RootBackend(shell)
-    backend.clear_app_cache("com.example", force_stop=True)
-    assert any("pm clear --cache-only com.example" in c for c in shell.calls)
-    assert all(c.startswith("su -c") for c in shell.calls)
+
+    stats = backend.clear_app_cache("com.example", force_stop=True)
+
+    # measured before deleting, so the caller can report what was freed
+    assert stats.bytes == 150748 * 1024
+    # the delete itself ran as the app's uid, not as root
+    assert any(
+        c.startswith("su 10316 -c") and "find" in c and "-delete" in c
+        for c in shell.calls
+    ), shell.calls
+    # and never through the package manager, which would also wipe bookkeeping
+    assert not any("pm clear" in c for c in shell.calls), shell.calls
+    # nothing may ever be chowned
+    assert not any("chown" in c for c in shell.calls), shell.calls
+
+
+def test_root_backend_refuses_app_without_data_directory():
+    shell = FakeShell({"su -c 'stat": (1, "", "No such file or directory")})
+    backend = RootBackend(shell)
+    with pytest.raises(BackendError):
+        backend.clear_app_cache("com.gone")
+    assert not any("find" in c for c in shell.calls), shell.calls
 
 
 def test_root_backend_requires_runner_when_not_root():
