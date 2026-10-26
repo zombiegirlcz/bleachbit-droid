@@ -290,3 +290,52 @@ def test_api_passes_vacuum_runner_to_root_backend():
     finally:
         api._ROOT_RUNNER = None
         api._VACUUM_RUNNER = None
+
+
+def test_list_sized_uses_a_real_tab_in_the_stat_format():
+    """Regression: the format string had a literal backslash-t.
+
+    ``stat -c '%s\t%n'`` inside a Python string that ends up in a shell
+    command must contain an actual TAB. With ``'%s\\t%n'`` (two characters,
+    backslash and t) the output was ``4096\\t/path`` and the ``split("\t")``
+    below never matched, so list_sized() silently returned nothing and every
+    scan reported 0 B.
+    """
+    shell = FakeShell(
+        {
+            "find": (0, "4096\t/sdcard/c/a.bin\n2048\t/sdcard/c/sub/b.bin\n", ""),
+            "test -d": (0, "", ""),
+        }
+    )
+    backend = AdbBackend(shell, "/data/user/0/x/files")
+
+    sized = backend.list_sized("/sdcard/c/**")
+
+    assert sized == [("/sdcard/c/a.bin", 4096), ("/sdcard/c/sub/b.bin", 2048)]
+    joined = " | ".join(shell.calls)
+    # The command must carry a real TAB, not the two characters '\' and 't'.
+    assert "\t" in joined
+    assert "\\t" not in joined
+
+
+def test_list_sized_is_one_shell_call_for_the_whole_target():
+    """A target with N files must cost one command, not N."""
+    lines = "".join(f"10\t/sdcard/c/f{i}.bin\n" for i in range(500))
+    shell = FakeShell({"find": (0, lines, ""), "test -d": (0, "", "")})
+    backend = AdbBackend(shell, "/data/user/0/x/files")
+
+    sized = backend.list_sized("/sdcard/c/**")
+
+    assert len(sized) == 500
+    assert len(shell.calls) == 1
+
+
+def test_list_sized_skips_malformed_lines():
+    shell = FakeShell(
+        {
+            "find": (0, "10\t/good\nnotanumber\t/bad\n\n20\t/also-good\n", ""),
+            "test -d": (0, "", ""),
+        }
+    )
+    backend = AdbBackend(shell, "/data/user/0/x/files")
+    assert backend.list_sized("/x/**") == [("/good", 10), ("/also-good", 20)]

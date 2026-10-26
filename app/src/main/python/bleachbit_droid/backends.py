@@ -316,7 +316,7 @@ class _ShellMixin:
             f"find {shell_quote(base)} "
             f"\\( -path {shell_quote(glob_pattern)} -o -path {shell_quote(nested)} \\) "
             f"\\( -type f -o -type l \\) "
-            f"-exec stat -c '%s\\t%n' {{}} +"
+            f"-exec stat -c '%s\t%n' {{}} +"
         )
         if code != 0:
             return []
