@@ -68,14 +68,20 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         ShizukuRunner.onBinderChanged = { refreshPermissions() }
         ShizukuRunner.startListeners()
 
+        // Register the VACUUM bridge *before* any reload: `supports_sqlite` is
+        // derived from whether a runner was injected, and the synchronous
+        // reload() below runs before the IO coroutine finishes. Without this
+        // the UI listed own_databases as "missing sqlite3" even though the
+        // bundled sqlite3 works (GuestSelfTest proves it a moment later).
+        // Registration itself touches no disk; VacuumRunner re-checks
+        // GuestTool.isAvailable() at call time, so it is safe to do here.
+        PythonBridge.registerVacuumRunner(VacuumRunner(context))
+
         // Install the bundled glibc toolchain and prove it runs, off the main
         // thread: extraction touches disk and the smoke test spawns processes.
         viewModelScope.launch(Dispatchers.IO) {
             RootfsInstaller.ensure(context)
             GuestSelfTest.run(context)
-            // The Python core only learns about the guest toolchain here, so
-            // scan/apply can VACUUM databases on the non-root tier.
-            PythonBridge.registerVacuumRunner(VacuumRunner(context))
             detectModes()
             reload()
         }

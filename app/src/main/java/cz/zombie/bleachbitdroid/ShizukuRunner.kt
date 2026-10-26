@@ -5,6 +5,7 @@ import android.util.Log
 import org.json.JSONObject
 import rikka.shizuku.Shizuku
 import java.io.InputStream
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
@@ -21,7 +22,7 @@ class ShizukuRunner : ShellRunner {
             val stderr = StringBuilder()
             val outThread = drain(process.inputStream, stdout)
             val errThread = drain(process.errorStream, stderr)
-            val finished = process.waitFor(TIMEOUT_SEC, TimeUnit.SECONDS)
+            val finished = waitForExit(process, TIMEOUT_SEC)
             if (!finished) {
                 process.destroyForcibly()
                 outThread.join(1000)
@@ -46,6 +47,34 @@ class ShizukuRunner : ShellRunner {
             result.put("stderr", t.message ?: t.javaClass.simpleName)
             result.toString()
         }
+    }
+
+    /**
+     * Wait for [process] to exit, bounded by [seconds].
+     *
+     * `Process.waitFor(timeout, unit)` cannot be used here: the default
+     * implementation polls `exitValue()`, and `ShizukuRemoteProcess.exitValue()`
+     * throws `IllegalArgumentException: process hasn't exited` instead of
+     * reporting that the process is still running. That made every Shizuku
+     * command fail with exit code -1, so the ADB tier never appeared.
+     *
+     * `waitFor()` (no timeout) is a blocking binder call and is safe; run it on
+     * a throwaway thread so we can still give up after [seconds].
+     */
+    private fun waitForExit(process: Process, seconds: Long): Boolean {
+        val done = CountDownLatch(1)
+        val waiter = Thread {
+            try {
+                process.waitFor()
+            } catch (_: Throwable) {
+                // process died or the binder went away
+            } finally {
+                done.countDown()
+            }
+        }
+        waiter.isDaemon = true
+        waiter.start()
+        return done.await(seconds, TimeUnit.SECONDS)
     }
 
     private fun newProcess(cmd: Array<String>): Process {
