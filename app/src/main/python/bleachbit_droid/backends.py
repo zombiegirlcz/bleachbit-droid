@@ -342,11 +342,23 @@ class _SqliteMixin:
         raise NotImplementedError
 
     def vacuum_db(self, path: str) -> Stats:
-        before = os.path.getsize(path) if os.path.isfile(path) else 0
+        """Rebuild the database and report how much actually left the disk.
+
+        Sizes are asked from ``self.size()``, not ``os.path.getsize``: on the
+        ADB and root tiers this process cannot see the file at all, so a local
+        stat would silently report 0.
+        """
+        try:
+            before = self.size(path)
+        except (BackendError, OSError):
+            before = 0
         code, out, err = self._vacuum_runner()(path)
         if code != 0:
             raise BackendError(f"sqlite3 exit {code}: {err.strip() or out.strip()}")
-        after = os.path.getsize(path) if os.path.isfile(path) else 0
+        try:
+            after = self.size(path)
+        except (BackendError, OSError):
+            after = 0
         return Stats(files=1, bytes=max(before - after, 0))
 
 
@@ -465,21 +477,31 @@ class AdbBackend(_SqliteMixin, _ShellMixin, PrivilegeBackend):
 # root: everything, optionally through `su`
 # ---------------------------------------------------------------------------
 
-class RootBackend(_ShellMixin, PrivilegeBackend):
+class RootBackend(_SqliteMixin, _ShellMixin, PrivilegeBackend):
     """Everything, through direct syscalls when already root, or through a
     ``su`` runner supplied by the Kotlin side.
 
     In Chaquopy ``os.geteuid()`` is never 0, so on a rooted device the Kotlin
     side passes a runner that prefixes commands with ``su -c``.
+
+    The SQLite mixin is inherited here as well: without it the root tier
+    advertised every database cleaner as "missing: sqlite3", even though the
+    bundled sqlite3 runs just as well as it does on the non-root tier.
     """
 
     name = "root"
     capabilities = frozenset(Capability)
 
-    def __init__(self, runner=None) -> None:
+    def __init__(self, runner=None, vacuum_runner=None) -> None:
         self._runner = runner
+        self._vacuum = vacuum_runner
         if runner is None and os.geteuid() != 0:
             raise BackendError("root backend requires euid 0 or a su runner")
+
+    def _vacuum_runner(self):
+        if self._vacuum is None:
+            raise BackendError("no sqlite3 runner registered")
+        return self._vacuum
 
     # -- path ops -------------------------------------------------------
     def measure(self, path: str) -> Stats:

@@ -77,7 +77,7 @@ def _backend(data: dict[str, Any]):
         runner = _ROOT_RUNNER
         if runner is None:
             raise BackendError("root backend requested but no su runner registered")
-        return RootBackend(runner)
+        return RootBackend(runner, vacuum_runner=vacuum)
     if mode == "adb":
         runner = _ADB_RUNNER
         if runner is None:

@@ -180,7 +180,7 @@ def build_backend(args: argparse.Namespace):
 
     if args.mode == "root":
         runner = CliShellRunner(RUNNER_PREFIXES[args.runner])
-        return RootBackend(runner)
+        return RootBackend(runner, vacuum_runner=vacuum)
 
     raise BackendError(f"unknown mode {args.mode!r}")
 

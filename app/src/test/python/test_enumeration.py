@@ -14,6 +14,8 @@ Run from the ``app`` directory:
 
 from __future__ import annotations
 
+import json
+
 import sys
 from pathlib import Path
 
@@ -24,10 +26,12 @@ PY_ROOT = HERE.parents[2] / "main" / "python"
 sys.path.insert(0, str(PY_ROOT))
 
 from bleachbit_droid import engine  # noqa: E402
+from bleachbit_droid import api  # noqa: E402
 from bleachbit_droid.backends import (  # noqa: E402
     AdbBackend,
     BackendError,
     NonRootBackend,
+    RootBackend,
     _find_base_and_glob,
 )
 
@@ -234,3 +238,51 @@ def test_engine_scan_enumerates_through_the_backend(tmp_path: Path):
 
     assert calls, "engine did not enumerate through the backend"
     assert report.total_bytes == 100
+
+
+# ---------------------------------------------------------------------------
+# SQLite support must be advertised by every tier that can actually vacuum
+# ---------------------------------------------------------------------------
+
+
+def test_root_backend_reports_sqlite_when_runner_injected():
+    """Regression: RootBackend did not inherit _SqliteMixin.
+
+    The root tier therefore listed every database cleaner as
+    "missing: sqlite3" although the bundled sqlite3 works there too.
+    """
+    backend = RootBackend(None if __import__("os").geteuid() == 0 else FakeShell(),
+                          vacuum_runner=lambda path: (0, "", ""))
+    assert backend.supports_sqlite is True
+
+
+def test_root_backend_without_vacuum_runner_cannot_vacuum():
+    backend = RootBackend(None if __import__("os").geteuid() == 0 else FakeShell())
+    assert backend.supports_sqlite is False
+    with pytest.raises(BackendError):
+        backend.vacuum_db("/tmp/nope.db")
+
+
+def test_api_passes_vacuum_runner_to_root_backend():
+    seen = []
+
+    class Runner:
+        def run(self, command):
+            return 0, "uid=0(root) gid=0(root)", ""
+
+    class Vac:
+        def run(self, path):
+            seen.append(path)
+            return json.dumps({"code": 0, "stdout": "", "stderr": ""})
+
+    api.set_root_runner(Runner())
+    api.set_vacuum_runner(Vac())
+    try:
+        payload = json.dumps({"mode": "root", "cleaners": ["own_databases"]})
+        out = json.loads(api.list_cleaners(payload))
+        assert "error" not in out, out
+        assert out["backend"]["supports_sqlite"] is True
+        assert seen == [], "listing cleaners must not vacuum anything"
+    finally:
+        api._ROOT_RUNNER = None
+        api._VACUUM_RUNNER = None
