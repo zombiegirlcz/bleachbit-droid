@@ -302,3 +302,7 @@ Všechno níže má regresní test; co šlo, je ověřené na zařízení přes
 - `57fa77a` fix: callback jako samostatný Chaquopy argument
 - `100b93d` feat: reálné cíle čištění, root maže cache pod uid appky
 - `a66b2d6` fix: `onEvent` má přednost před `__call__` (progress konečně funguje)
+- `a8e7030` fix: scan nikdy nenabídne adresář jako mazatelnou položku
+- `3f65da6` fix: každý tier dělá to, co nabízí (non-root sdílené úložiště,
+  dávkové mazání, vratná `ShellSession`, gating VACUUMu, prázdné soubory,
+  progress čísla, `ashell` runner, první JVM test)
