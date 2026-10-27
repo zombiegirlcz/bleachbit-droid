@@ -17,8 +17,9 @@ Usage (from ``app/src/main/python``)::
 The three runners map to the three privilege tiers:
 
 ``local``   ``sh -c`` in this process        — non-root tier, desktop testing
-``nh-adb``  ``nh adb shell sh -c``           — ADB tier over the adb bridge
+``nh-adb``  ``nh adb shell``                 — ADB tier over the adb bridge
 ``su``      ``su 0 -c``                      — root tier
+``ashell``  ``ashell -c 'su -c …'``          — root tier from inside the proot
 
 Output is human readable Czech by default, ``--json`` prints the raw report the
 Kotlin side would receive, ``--log`` adds one JSON line per action (AGENTS.md §8).
@@ -35,21 +36,32 @@ import sys
 from typing import Any, Callable, Sequence
 
 from . import engine
-from .backends import AdbBackend, BackendError, NonRootBackend, RootBackend
+from .backends import AdbBackend, BackendError, NonRootBackend, RootBackend, shell_quote
 
 #: One shell command must never hang the CLI forever.
 TIMEOUT_SEC = 120
 
-#: argv prefixes for the three runners; the command string is appended as one arg.
+#: argv prefixes for the runners; the command string is appended as one arg.
 #:
 #: ``nh adb shell`` already hands its argument to a shell on the device, so the
 #: prefix must NOT add ``sh -c``: doing that made `nh adb shell sh -c "a && b"`
 #: deliver only a fragment of the command to `sh` (the rest became positional
 #: arguments), which silently produced empty output for every probe.
-RUNNER_PREFIXES: dict[str, list[str]] = {
-    "local": ["sh", "-c"],
-    "nh-adb": ["nh", "adb", "shell"],
-    "su": ["su", "0", "-c"],
+#:
+#: ``su_wrap`` says the prefix lands somewhere that is *not* root yet, so the
+#: command has to be re-wrapped in ``su -c``. That is the case for ``ashell``:
+#: inside the proot, ``su`` cannot reach the Magisk daemon
+#: (``magisk daemon nedostupný``), while ``ashell -c`` runs outside it as the
+#: app's uid and ``su -c`` there yields ``uid=0 … u:r:magisk:s0``. It is the
+#: only way to exercise the root tier without installing the APK.
+#:
+#: ``RootBackend`` itself sends plain commands and expects the runner to be
+#: root already — the Kotlin side keeps one persistent ``su`` shell open.
+RUNNER_SPECS: dict[str, tuple[list[str], bool]] = {
+    "local": (["sh", "-c"], False),
+    "nh-adb": (["nh", "adb", "shell"], False),
+    "su": (["su", "0", "-c"], False),
+    "ashell": (["ashell", "-c"], True),
 }
 
 
@@ -66,10 +78,13 @@ class CliShellRunner:
     bridge, ``su``) to it.
     """
 
-    def __init__(self, prefix: Sequence[str]) -> None:
+    def __init__(self, prefix: Sequence[str], su_wrap: bool = False) -> None:
         self._prefix = list(prefix)
+        self._su_wrap = su_wrap
 
     def run(self, command: str) -> tuple[int, str, str]:
+        if self._su_wrap:
+            command = f"su -c {shell_quote(command)}"
         argv = [*self._prefix, command]
         try:
             proc = subprocess.run(
@@ -150,6 +165,12 @@ def make_vacuum_runner(args: argparse.Namespace) -> Callable[[str], tuple[int, s
 # ---------------------------------------------------------------------------
 
 
+def make_runner(args: argparse.Namespace) -> CliShellRunner:
+    """Build the shell runner selected by ``--runner``."""
+    prefix, su_wrap = RUNNER_SPECS[args.runner]
+    return CliShellRunner(prefix, su_wrap)
+
+
 def build_roots(args: argparse.Namespace) -> dict[str, str]:
     return {
         "app_files": args.app_files,
@@ -172,15 +193,18 @@ def build_backend(args: argparse.Namespace):
 
     if args.mode == "nonroot":
         allowed = [p for p in (roots["app_files"], roots["app_cache"], roots["external"]) if p]
-        return NonRootBackend(allowed, vacuum_runner=vacuum)
+        # Mirrors the app: shared storage counts only when it is reachable.
+        # `--no-shared-storage` reproduces a device without the all-files grant.
+        shared = not args.no_shared_storage
+        if shared:
+            allowed += [p for p in (roots["sdcard"], roots["android_media"]) if p]
+        return NonRootBackend(allowed, vacuum_runner=vacuum, shared_storage=shared)
 
     if args.mode == "adb":
-        runner = CliShellRunner(RUNNER_PREFIXES[args.runner])
-        return AdbBackend(runner, roots["app_files"], vacuum_runner=vacuum)
+        return AdbBackend(make_runner(args), roots["app_files"], vacuum_runner=vacuum)
 
     if args.mode == "root":
-        runner = CliShellRunner(RUNNER_PREFIXES[args.runner])
-        return RootBackend(runner, vacuum_runner=vacuum)
+        return RootBackend(make_runner(args), vacuum_runner=vacuum)
 
     raise BackendError(f"unknown mode {args.mode!r}")
 
@@ -211,7 +235,9 @@ def human_bytes(size: int) -> str:
 def print_cleaners(items: list[dict[str, Any]]) -> None:
     for item in items:
         mark = "✓" if item["enabled"] else "✗"
-        extra = f" • chybí: {', '.join(item['missing'])}" if item["missing"] else ""
+        # Prefer the Czech labels; they are what the app shows the user.
+        why = item.get("missing_labels") or item["missing"]
+        extra = f" • chybí: {', '.join(why)}" if why else ""
         print(f"{mark} {item['name']:<18} {item['risk']:<7} {item['description']}{extra}")
 
 
@@ -253,14 +279,25 @@ def cmd_detect(args: argparse.Namespace) -> int:
     notes: dict[str, str] = {}
     available = ["nonroot"]
 
-    for mode in ("adb", "root"):
-        runner = CliShellRunner(RUNNER_PREFIXES[args.runner if mode == "adb" else "su"])
-        code, out, err = runner.run("id")
-        if code == 0 and "uid=" in out:
-            available.append(mode)
-            notes[mode] = out.strip()
+    runner = make_runner(args)
+    code, out, err = runner.run("id")
+    identity = out.strip()
+
+    # Mirrors api.detect(): any working shell is enough for the ADB tier, the
+    # root tier has to actually be uid 0. Reporting both as available just
+    # because `id` exited zero made `detect --runner local` claim root.
+    if code == 0 and "uid=" in identity:
+        available.append("adb")
+        notes["adb"] = identity
+        if "uid=0" in identity:
+            available.append("root")
+            notes["root"] = identity
         else:
-            notes[mode] = f"exit {code}: {(err or out).strip() or 'no output'}"
+            notes["root"] = f"runner is not root: {identity}"
+    else:
+        reason = f"exit {code}: {(err or out).strip() or 'no output'}"
+        notes["adb"] = reason
+        notes["root"] = reason
 
     if args.json:
         print(json.dumps({"available": available, "notes": notes}, ensure_ascii=False))
@@ -348,6 +385,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--external",
         default="/storage/emulated/0/Android/data/cz.zombie.bleachbitdroid/files",
     )
+    common.add_argument(
+        "--no-shared-storage",
+        action="store_true",
+        help="non-root tier without the all-files grant (shared storage denied)",
+    )
     common.add_argument("--sdcard", default="/sdcard")
     common.add_argument("--android-data", default="/data/data")
     common.add_argument("--android-media", default="/data/media/0")
@@ -361,7 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     detect = sub.add_parser("detect", parents=[common], help="which privilege tiers are usable")
-    detect.add_argument("--runner", choices=sorted(RUNNER_PREFIXES), default="local")
+    detect.add_argument("--runner", choices=sorted(RUNNER_SPECS), default="local")
     detect.set_defaults(func=cmd_detect)
 
     for name, func, help_text in (
@@ -371,7 +413,7 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         p = sub.add_parser(name, parents=[common], help=help_text)
         p.add_argument("--mode", choices=("nonroot", "adb", "root"), default="nonroot")
-        p.add_argument("--runner", choices=sorted(RUNNER_PREFIXES), default="local")
+        p.add_argument("--runner", choices=sorted(RUNNER_SPECS), default="local")
         if name != "cleaners":
             p.add_argument("--cleaners", default="all", help="comma separated, or 'all'")
         if name == "clean":

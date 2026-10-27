@@ -20,11 +20,12 @@ from typing import Any, Callable
 
 import re
 
-from .backends import BackendError, PrivilegeBackend
-from .capabilities import missing
+from .backends import BackendError, PrivilegeBackend, Stats
+from .capabilities import CAPABILITY_LABELS, missing
 from .cleaners import all_cleaners, by_name
 from .models import (
     Action,
+    Capability,
     CleanerSpec,
     CleanReport,
     Entry,
@@ -36,6 +37,11 @@ from .models import (
 
 
 _PLACEHOLDER = re.compile(r"<([a-z_]+)>")
+
+#: How many deletions to hand the backend at once. Big enough that the shell
+#: round trip stops dominating, small enough that the progress panel keeps
+#: moving instead of jumping in one block at the end.
+DELETE_FLUSH = 100
 
 
 # ---------------------------------------------------------------------------
@@ -86,24 +92,45 @@ def select_cleaners(
             continue
         if spec.kind is Kind.PACKAGE and not backend.supports_packages:
             continue
-        if spec.kind is Kind.SQLITE and not backend.supports_sqlite:
+        if spec.kind is Kind.SQLITE and not backend.can_vacuum(spec.requires):
             continue
         result.append(spec)
     return result
+
+
+#: Czech labels for the non-capability entries of a cleaner's ``missing`` list.
+#: The UI prints these verbatim, so they have to read as sentences fragments,
+#: not as internal tokens.
+MISSING_LABELS: dict[str, str] = {
+    "shell": "přístup k shellu",
+    "sqlite3": "nástroj sqlite3",
+    "sqlite3_as_owner": "sqlite3 nemůže běžet pod uid vlastníka databáze",
+}
 
 
 def describe(backend: PrivilegeBackend) -> list[dict]:
     """Registry view used by the UI: every cleaner + whether it is runnable."""
     out = []
     for spec in all_cleaners():
-        miss = missing(spec.requires, backend.capabilities)
+        miss: list = list(missing(spec.requires, backend.capabilities))
         if spec.kind is Kind.PACKAGE and not backend.supports_packages:
-            miss = miss + ["shell"] if "shell" not in miss else miss
-        if spec.kind is Kind.SQLITE and not backend.supports_sqlite:
-            miss = miss + ["sqlite3"] if "sqlite3" not in miss else miss
+            if "shell" not in miss:
+                miss.append("shell")
+        if spec.kind is Kind.SQLITE and not backend.can_vacuum(spec.requires):
+            # Two different reasons, and the user can only act on one of them:
+            # a missing tool is a bug, a database we may not touch as its owner
+            # is a permanent property of the tier.
+            token = "sqlite3" if not backend.supports_sqlite else "sqlite3_as_owner"
+            if token not in miss:
+                miss.append(token)
         item = spec.to_dict()
         item["enabled"] = not miss
-        item["missing"] = list(miss)
+        item["missing"] = [getattr(m, "value", m) for m in miss]
+        item["missing_labels"] = [
+            CAPABILITY_LABELS[m] if isinstance(m, Capability)
+            else MISSING_LABELS.get(m, str(m))
+            for m in miss
+        ]
         out.append(item)
     return out
 
@@ -160,6 +187,11 @@ def scan(
 
     for spec in specs:
         emit("cleaner_start", cleaner=spec.name, description=spec.description)
+        # Remembered so `cleaner_done` can report what *this* cleaner found.
+        # It used to send the running total of the whole scan, which the UI
+        # then printed next to the cleaner's name as if it were its own.
+        base_bytes = report.total_bytes
+        base_entries = len(report.entries)
         if spec.kind is Kind.SQLITE:
             for target in spec.paths:
                 if not backend.can(target.requires):
@@ -289,8 +321,11 @@ def scan(
             for leaf, size in sized:
                 if leaf in seen:
                     continue
-                if size == 0:
-                    continue
+                # Zero-length files used to be dropped here, which meant they
+                # were scanned, reported and then never removed: a clean left
+                # them behind forever. `list_sized()` only ever yields files
+                # (never the glob root, never a directory), so an empty entry
+                # is a real file that belongs to the cleaner.
                 seen.add(leaf)
                 report.entries.append(
                     Entry(
@@ -322,7 +357,8 @@ def scan(
         emit(
             "cleaner_done",
             cleaner=spec.name,
-            entries=len(report.entries),
+            bytes=report.total_bytes - base_bytes,
+            entries=len(report.entries) - base_entries,
             total_bytes=report.total_bytes,
         )
     emit(
@@ -363,12 +399,87 @@ def apply(
     report = CleanReport(backend=backend.name, dry_run=dry_run)
     emit("start", backend=backend.name, dry_run=dry_run)
 
-    scanned = scan(backend, roots, names, unused_packages)
+    # Pass the callback down: scanning is the long part of a clean on a shell
+    # backend, and without this the UI showed nothing at all between
+    # "Spouštím čištění…" and the first delete.
+    scanned = scan(backend, roots, names, unused_packages, on_event)
     total = len(scanned.entries)
     emit("scanned", entries=total, bytes=scanned.total_bytes)
 
+    def record_deleted(index: int, entry: Entry, stats: Stats) -> None:
+        report.deleted += stats.files
+        report.freed_bytes += stats.bytes
+        if not stats.size_known:
+            report.unknown += 1
+        report.log.append(
+            LogRecord(
+                backend=backend.name,
+                cleaner=entry.cleaner,
+                path=entry.path,
+                action=Action.DELETE,
+                bytes=stats.bytes,
+                result=Result.OK,
+                reason="" if stats.size_known else "velikost na této úrovni nezjistitelná",
+            )
+        )
+        emit(
+            "deleted",
+            index=index,
+            total=total,
+            path=entry.path,
+            cleaner=entry.cleaner,
+            bytes=stats.bytes,
+            size_known=stats.size_known,
+        )
+
+    def record_failed(index: int, entry: Entry, reason: str) -> None:
+        report.failed += 1
+        report.log.append(
+            LogRecord(
+                backend=backend.name,
+                cleaner=entry.cleaner,
+                path=entry.path,
+                action=Action.DELETE,
+                bytes=entry.size,
+                result=Result.FAILED,
+                reason=reason,
+            )
+        )
+        emit(
+            "failed",
+            index=index,
+            total=total,
+            path=entry.path,
+            cleaner=entry.cleaner,
+            bytes=entry.size,
+            reason=reason,
+        )
+
+    # Plain file deletions are batched (see PrivilegeBackend.delete_many): on a
+    # shell backend the per-file path cost four commands per file, so clearing
+    # /data/dalvik-cache meant thousands of round trips for a scan that had
+    # already measured everything in two. Reporting stays per file and in scan
+    # order, so the log and the progress panel look exactly as before.
+    pending: list[tuple[int, Entry]] = []
+
+    def flush() -> None:
+        if not pending:
+            return
+        try:
+            results = backend.delete_many([(e.path, e.size) for _, e in pending])
+        except (BackendError, OSError) as exc:
+            results = {e.path: str(exc) for _, e in pending}
+        for index, entry in pending:
+            reason = results.get(entry.path, "backend nenahlásil tuto cestu")
+            if reason:
+                record_failed(index, entry, reason)
+            else:
+                record_deleted(index, entry, Stats(files=1, bytes=entry.size))
+        pending.clear()
+
     for index, entry in enumerate(scanned.entries, start=1):
         if not backend.can(entry.requires):
+            flush()
             reason = f"missing capability {entry.requires.value}"
             report.log.append(
                 LogRecord(
@@ -415,63 +526,35 @@ def apply(
             )
             continue
 
-        try:
-            if entry.package:
-                stats = backend.clear_app_cache(entry.package)
-            elif entry.cleaner and by_name(entry.cleaner).kind is Kind.SQLITE:
-                stats = backend.vacuum_db(entry.path)
-            else:
-                stats = backend.delete(entry.path)
-        except (BackendError, OSError) as exc:
-            report.failed += 1
-            report.log.append(
-                LogRecord(
-                    backend=backend.name,
-                    cleaner=entry.cleaner,
-                    path=entry.path,
-                    action=Action.DELETE,
-                    bytes=entry.size,
-                    result=Result.FAILED,
-                    reason=str(exc),
-                )
-            )
-            emit(
-                "failed",
-                index=index,
-                total=total,
-                path=entry.path,
-                cleaner=entry.cleaner,
-                bytes=entry.size,
-                reason=str(exc),
-            )
+        # Packages and databases are one device operation each, so they are
+        # handled individually — and they flush the batch first to keep every
+        # report line in scan order.
+        is_sqlite = bool(entry.cleaner) and by_name(entry.cleaner).kind is Kind.SQLITE
+        if entry.package or is_sqlite:
+            flush()
+            try:
+                if entry.package:
+                    stats = backend.clear_app_cache(entry.package)
+                else:
+                    stats = backend.vacuum_db(entry.path)
+            except (BackendError, OSError) as exc:
+                record_failed(index, entry, str(exc))
+                continue
+            record_deleted(index, entry, stats)
             continue
 
-        report.deleted += stats.files
-        report.freed_bytes += stats.bytes
-        report.log.append(
-            LogRecord(
-                backend=backend.name,
-                cleaner=entry.cleaner,
-                path=entry.path,
-                action=Action.DELETE,
-                bytes=stats.bytes,
-                result=Result.OK,
-            )
-        )
-        emit(
-            "deleted",
-            index=index,
-            total=total,
-            path=entry.path,
-            cleaner=entry.cleaner,
-            bytes=stats.bytes,
-        )
+        pending.append((index, entry))
+        if len(pending) >= DELETE_FLUSH:
+            flush()
+
+    flush()
 
     emit(
         "done",
         freed_bytes=report.freed_bytes,
         deleted=report.deleted,
         failed=report.failed,
+        unknown=report.unknown,
     )
 
     return report

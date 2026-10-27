@@ -25,4 +25,7 @@ app/build/python/
 # misc
 .DS_Store
 *.log
-ktlintapkmanifest.xml
+ktlint
+
+# Dumped device manifest, not source.
+apkmanifest.xml

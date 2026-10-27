@@ -45,6 +45,12 @@ jobs:
         with:
           gradle-version: "8.14.3"
 
+      - name: Unit tests (JVM)
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME || '/usr/local/lib/android/sdk' }}
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_HOME || '/usr/local/lib/android/sdk' }}
+        run: gradle :app:testDebugUnitTest --no-daemon --stacktrace
+
       - name: Assemble debug
         env:
           ANDROID_HOME: ${{ env.ANDROID_HOME || '/usr/local/lib/android/sdk' }}

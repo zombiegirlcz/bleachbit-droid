@@ -36,27 +36,53 @@ object UsageStatsProvider {
         val now = System.currentTimeMillis()
         val cutoff = now - TimeUnit.DAYS.toMillis(days.toLong())
 
-        // Everything the device saw in the window; last time used is per package.
-        val stats = manager.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, cutoff, now)
-            ?: return emptyList()
-
+        // Every retained interval, not just the last [days] days.
+        //
+        // This used to ask for INTERVAL_DAILY between `cutoff` and `now`, which
+        // is the one window that cannot contain the answer: an app unused for
+        // 30+ days has no bucket in the last 30 days at all, so it never showed
+        // up and the cleaner found nothing to do. Android keeps daily buckets
+        // for about a week, weekly for a month, monthly for half a year and
+        // yearly for two years, so the longest intervals are the ones that
+        // actually know when an app was last opened.
         val lastUsed = mutableMapOf<String, Long>()
-        for (s in stats) {
-            val prev = lastUsed[s.packageName]
-            if (prev == null || s.lastTimeUsed > prev) {
-                lastUsed[s.packageName] = s.lastTimeUsed
+        for (interval in INTERVALS) {
+            val stats = manager.queryUsageStats(interval, 0L, now) ?: continue
+            for (s in stats) {
+                val previous = lastUsed[s.packageName] ?: 0L
+                if (s.lastTimeUsed > previous) lastUsed[s.packageName] = s.lastTimeUsed
             }
         }
 
-        val installed = context.packageManager.getInstalledPackages(0)
-            .map { it.packageName }
-            .toSet()
+        // No data at all means usage access was just granted (or the stats were
+        // wiped), not that every app is unused. Guessing here would clear the
+        // caches of apps the user opens daily.
+        if (lastUsed.isEmpty()) return emptyList()
 
-        return lastUsed
-            .filter { (pkg, whenUsed) ->
-                pkg in installed && whenUsed in 1 until cutoff && pkg != context.packageName
+        // Only apps the user can actually launch.
+        //
+        // Taking every installed package would hand the cleaner hundreds of
+        // system components that have no usage statistics *because they have
+        // no UI* - they would all look "unused for 30+ days" and have their
+        // caches cleared, which is not what the cleaner promises.
+        val pm = context.packageManager
+        return pm.getInstalledPackages(0)
+            .map { it.packageName }
+            .filter { pkg ->
+                if (pkg == context.packageName) return@filter false
+                if (pm.getLaunchIntentForPackage(pkg) == null) return@filter false
+                // Absent from every bucket means not opened within the
+                // retained history, which is the strongest "unused" signal
+                // available.
+                (lastUsed[pkg] ?: 0L) < cutoff
             }
-            .keys
             .sorted()
     }
+
+    private val INTERVALS = listOf(
+        UsageStatsManager.INTERVAL_YEARLY,
+        UsageStatsManager.INTERVAL_MONTHLY,
+        UsageStatsManager.INTERVAL_WEEKLY,
+        UsageStatsManager.INTERVAL_DAILY,
+    )
 }

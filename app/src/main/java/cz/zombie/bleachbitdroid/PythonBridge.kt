@@ -1,6 +1,8 @@
 package cz.zombie.bleachbitdroid
 
 import android.content.Context
+import android.os.Build
+import android.os.Environment
 import android.util.Log
 import com.chaquo.python.PyObject
 import com.chaquo.python.Python
@@ -134,8 +136,26 @@ object PythonBridge {
         put("sdcard", "/sdcard")
         put("android_data", "/data/data")
         put("android_media", "/data/media/0")
+        // Decides whether the non-root tier may claim `shared_storage` at all.
+        // Without the grant the process can enumerate /sdcard but not delete
+        // in it, so every shared-storage cleaner used to scan fine and then
+        // fail on every single file.
+        put("all_files", hasAllFilesAccess())
     }
 }
+
+/**
+ * True when the app holds MANAGE_EXTERNAL_STORAGE (or predates the need).
+ *
+ * Lives next to the bridge because the Python side has to be told on every
+ * call: the user can flip this in system settings while the app is running.
+ */
+fun hasAllFilesAccess(): Boolean =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        Environment.isExternalStorageManager()
+    } else {
+        true
+    }
 
 /**
  * A single shell command runner. Implemented by [ShizukuRunner] and

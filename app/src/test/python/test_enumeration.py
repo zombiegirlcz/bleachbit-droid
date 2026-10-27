@@ -33,6 +33,7 @@ from bleachbit_droid.backends import (  # noqa: E402
     NonRootBackend,
     RootBackend,
     _find_base_and_glob,
+    shell_quote,
 )
 
 
@@ -339,3 +340,88 @@ def test_list_sized_skips_malformed_lines():
     )
     backend = AdbBackend(shell, "/data/user/0/x/files")
     assert backend.list_sized("/x/**") == [("/good", 10), ("/also-good", 20)]
+
+
+# ---------------------------------------------------------------------------
+# deletion is bulk too, not just enumeration
+# ---------------------------------------------------------------------------
+
+def test_shell_delete_is_one_command_per_batch():
+    """Regression: apply cost four shell commands per file.
+
+    ``delete()`` measured (``du``), probed (``test -f``, ``test -d``) and only
+    then removed, for every single file — even though the scan had already
+    measured all of them in two commands. On /data/dalvik-cache (851 MB,
+    ~2000 files) that is thousands of round trips through `su`.
+    """
+    shell = FakeShell()
+    backend = RootBackend(shell)
+    entries = [(f"/data/dalvik-cache/arm64/f{i}.oat", 100) for i in range(20)]
+
+    results = backend.delete_many(entries)
+
+    assert all(reason == "" for reason in results.values()), results
+    assert len(shell.calls) == 1, shell.calls
+    assert shell.calls[0].startswith("rm -f --")
+    for path, _size in entries:
+        assert shell_quote(path) in shell.calls[0]
+
+
+def test_shell_delete_splits_into_batches():
+    shell = FakeShell()
+    backend = RootBackend(shell)
+    count = backend.DELETE_BATCH * 2 + 5
+    entries = [(f"/data/local/tmp/f{i}", 1) for i in range(count)]
+
+    backend.delete_many(entries)
+
+    assert len(shell.calls) == 3, len(shell.calls)
+
+
+def test_shell_delete_pinpoints_the_file_that_failed():
+    """`rm` fails for the whole batch, the log has to name the real culprit."""
+    locked = "/data/local/tmp/locked"
+    shell = FakeShell({
+        f"rm -f -- {shell_quote(locked)}": (1, "", "Permission denied"),
+        f"{shell_quote(locked)}": (1, "", "Permission denied"),
+    })
+    backend = RootBackend(shell)
+    entries = [("/data/local/tmp/a", 1), (locked, 1), ("/data/local/tmp/b", 1)]
+
+    results = backend.delete_many(entries)
+
+    assert results["/data/local/tmp/a"] == ""
+    assert results["/data/local/tmp/b"] == ""
+    assert "Permission denied" in results[locked]
+
+
+def test_apply_deletes_through_the_batch_api(tmp_path: Path):
+    """The engine must route plain files through delete_many, in scan order."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for i in range(5):
+        (cache / f"f{i}.bin").write_bytes(b"x" * 10)
+
+    roots = {
+        "app_files": str(tmp_path),
+        "app_cache": str(cache),
+        "external": str(tmp_path),
+        "sdcard": str(tmp_path),
+        "android_data": str(tmp_path),
+        "android_media": str(tmp_path),
+    }
+
+    batched: list[list[str]] = []
+
+    class CountingBackend(NonRootBackend):
+        def delete_many(self, entries):
+            batched.append([p for p, _ in entries])
+            return NonRootBackend.delete_many(self, entries)
+
+    backend = CountingBackend([str(tmp_path)])
+    report = engine.apply(backend, roots, ["app_cache"], dry_run=False)
+
+    assert report.deleted == 5
+    assert report.freed_bytes == 50
+    assert len(batched) == 1, batched
+    assert not list(cache.iterdir())

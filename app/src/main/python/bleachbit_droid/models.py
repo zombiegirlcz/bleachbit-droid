@@ -185,6 +185,10 @@ class CleanReport:
     freed_bytes: int = 0
     deleted: int = 0
     failed: int = 0
+    #: Entries that were cleared successfully but whose size the tier could not
+    #: measure (ADB cannot read /data/data/<pkg>/cache). Without this the UI
+    #: printed "Uvolněno 0 B" after clearing hundreds of megabytes.
+    unknown: int = 0
     log: list[LogRecord] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -194,6 +198,7 @@ class CleanReport:
             "freed_bytes": self.freed_bytes,
             "deleted": self.deleted,
             "failed": self.failed,
+            "unknown": self.unknown,
             "log": [r.to_dict() for r in self.log],
         }
 

@@ -202,3 +202,118 @@ def test_as_callback_falls_back_to_plain_callable():
     fn = api._as_callback(cb)
     fn({"type": "x"})
     assert seen == [{"type": "x"}]
+
+
+# ---------------------------------------------------------------------------
+# the numbers in the events have to be the numbers the UI prints
+# ---------------------------------------------------------------------------
+
+def test_cleaner_done_reports_only_its_own_share(tmp_path: Path):
+    """Regression: it carried the running total of the whole scan.
+
+    The UI printed that next to the cleaner's name ("→ thumbnails: 901 MB"),
+    so every cleaner after the first looked like it had found everything.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "a.bin").write_bytes(b"x" * 100)
+    files_cache = tmp_path / "cache2"
+    files_cache.mkdir()
+    (files_cache / "b.bin").write_bytes(b"y" * 250)
+
+    roots = {
+        "app_files": str(tmp_path),
+        "app_cache": str(cache),
+        "external": str(tmp_path),
+        "sdcard": str(tmp_path),
+        "android_data": str(tmp_path),
+        "android_media": str(tmp_path),
+    }
+    events: list[dict] = []
+    backend = NonRootBackend([str(tmp_path)])
+
+    engine.scan(backend, roots, ["app_cache"], on_event=events.append)
+
+    done = [e for e in events if e["type"] == "cleaner_done"]
+    assert len(done) == 1
+    assert done[0]["bytes"] == 100, done[0]
+    assert done[0]["entries"] == 1
+    assert done[0]["total_bytes"] == 100
+
+
+def test_apply_reports_the_scan_it_runs(tree: Path, roots: dict[str, str]):
+    """Regression: apply() called scan() without the callback.
+
+    Scanning is the long part of a clean on a shell backend, so the UI showed
+    nothing at all between "Spouštím čištění…" and the first delete.
+    """
+    events: list[dict] = []
+    backend = NonRootBackend([str(tree)])
+
+    engine.apply(backend, roots, ["app_cache"], dry_run=True, on_event=events.append)
+
+    types = [e["type"] for e in events]
+    assert "start" in types
+    assert "scan_start" in types, types
+    assert "found" in types, types
+    assert "scanned" in types
+
+
+def test_done_event_carries_what_was_freed(tree: Path, roots: dict[str, str]):
+    """Regression: `done` only had `freed_bytes`, the sink only read
+    `total_bytes`, so every clean ended with "Uvolněno 0 B"."""
+    events: list[dict] = []
+    backend = NonRootBackend([str(tree)])
+
+    report = engine.apply(
+        backend, roots, ["app_cache"], dry_run=False, on_event=events.append
+    )
+
+    done = [e for e in events if e["type"] == "done"]
+    assert len(done) == 1
+    assert done[0]["freed_bytes"] == report.freed_bytes > 0
+    assert done[0]["unknown"] == 0
+
+    scanned = [e for e in events if e["type"] == "scanned"]
+    assert scanned[0]["bytes"] == report.freed_bytes
+
+
+def test_package_clear_without_a_measurable_size_is_reported_as_unknown():
+    """The ADB tier cannot read /data/data/<pkg>/cache (uid 2000 gets EACCES,
+    verified on device), so it must say "unknown", never "0 B"."""
+    from bleachbit_droid.backends import AdbBackend
+
+    class Shell:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def run(self, command: str):
+            self.calls.append(command)
+            if command.startswith("du "):
+                return 1, "", "du: Permission denied"
+            if command.startswith("pm list packages"):
+                return 0, "package:com.example\n", ""
+            return 0, "", ""
+
+    shell = Shell()
+    backend = AdbBackend(shell, "/app")
+
+    stats = backend.clear_app_cache("com.example")
+    assert stats.bytes == 0
+    assert stats.size_known is False
+    assert any("pm clear --cache-only" in c for c in shell.calls), shell.calls
+
+    events: list[dict] = []
+    report = engine.apply(
+        backend,
+        {k: "/x" for k in
+         ("app_files", "app_cache", "external", "sdcard", "android_data", "android_media")},
+        ["other_app_cache"],
+        dry_run=False,
+        on_event=events.append,
+    )
+    assert report.unknown == 1
+    assert report.failed == 0
+    deleted = [e for e in events if e["type"] == "deleted"]
+    assert deleted and deleted[0]["size_known"] is False
+    assert [e for e in events if e["type"] == "done"][0]["unknown"] == 1

@@ -46,15 +46,28 @@ Slouží k ladění stejných code paths bez instalace APK.
 
 `app_data` < `shared_storage` < `other_app_data` < `system`
 
-| backend | capabilities | packages | sqlite |
+| backend | capabilities | packages | sqlite (VACUUM) |
 |---|---|---|---|
-| `nonroot` | app_data, shared_storage | ne | ano (vestavěný `sqlite3`) |
-| `adb` | + other_app_data | ano | ano |
-| `root` | vše | ano | ano |
+| `nonroot` | app_data, **shared_storage jen s all-files** | ne | app_data, shared_storage |
+| `adb` | + other_app_data | ano | app_data, shared_storage |
+| `root` | vše | ano | app_data, shared_storage |
 
 Cleaner se spustí jen když `requires` je podmnožinou `backend.capabilities`;
 u `kind=package` navíc `backend.supports_packages`, u `kind=sqlite`
-`backend.supports_sqlite`.
+`backend.can_vacuum(requires)`.
+
+**Capability musí odpovídat tomu, co backend skutečně dovolí.** `NonRootBackend`
+hlásil `shared_storage` natvrdo, ale whitelist měl jen vlastní adresáře appky —
+enumerace guardem neprochází, takže scan `/sdcard` našel a každé mazání pak
+spadlo na „outside allowed roots“. `shared_storage` se teď odvozuje od
+předaných rootů (`all_files` v payloadu).
+
+**VACUUM jde jen tam, kde `sqlite3` může běžet pod uid vlastníka souboru.**
+Vestavěný `sqlite3` leží v našem `filesDir` (0700) a zařízení žádný systémový
+`sqlite3` nemá (ověřeno: nic v `/system/bin`, `/system/xbin`, runtime apex).
+Takže ani root tier nemůže vakuovat databázi cizí appky jako ta appka — a jako
+root by nechal root-owned journal v jejích datech (§6/2). Proto se
+`other_databases` vůbec nenabízí (`missing: sqlite3_as_owner`).
 
 ---
 
@@ -120,6 +133,14 @@ výsledek v logcatu.
    (Přesně to dělal zrušený `apk_leftovers`.)
 9. `unshare -m` → okamžitě `mount --make-rprivate /`; `$ROOTFS` není izolované
    prostředí.
+10. **Backend nesmí hlásit capability, kterou jeho guard nedovolí.** Scan, který
+    najde, a apply, který na všem spadne, je horší než cleaner vypnutý
+    s důvodem.
+11. **Prázdný soubor je soubor.** `scan()` zahazoval `size == 0`, takže je
+    ohlásil a nikdy nesmazal.
+12. **`ShellSession.close()` musí být vratné.** Latch `closed`, který se nikdy
+    nevynuloval, znamenal, že první timeout / mrtvý Shizuku binder / odmítnutý
+    Magisk prompt zabil celý tier do restartu appky.
 
 ---
 
@@ -133,6 +154,14 @@ výsledek v logcatu.
   celý target jedním `find … -exec stat -c '%s<TAB>%n' {} +`.
   Per-file `stat` = 1 shell příkaz na soubor (naměřeno: 2000 souborů
   ~68 s vs **1,3 s** jedním příkazem).
+- **Bulk mazání.** `PrivilegeBackend.delete_many()` dostane `(path, size)` ze
+  scanu a maže po dávkách (`rm -f --` po 200 cestách). Per-file `delete()`
+  stálo 4 příkazy na soubor (`du`, `test -f`, `test -d`, `rm`), i když scan
+  velikosti už znal — naměřeno 20 souborů: **82 → 3 příkazy**. Dávka, která
+  selže, se dohledá po jednom, aby log pojmenoval skutečný viník.
+- **Runner je root, ne příkaz.** `RootBackend` posílá příkazy nezabalené;
+  obalování každého příkazu `su -c '…'` zakládalo nový `su` proces uvnitř
+  persistentního root shellu, tedy přesně to, čemu se `ShellSession` vyhýbá.
 - **`stat -c '%s\t%n'` musí v příkazu obsahovat skutečný TAB**, ne dva znaky
   `\` a `t`. Test to hlídá.
 - **Progress je povinný.** `engine.scan()` i `engine.apply()` berou `on_event`;
@@ -170,6 +199,10 @@ výsledek v logcatu.
   `nh adb install /sdcard/Download/x.apk`. **`nh adb push` nefunguje** —
   `nh adb` je server pod uid 2000 a cesty z prootu nevidí.
 - Testovací matrice: `{nonroot, adb, root} × {dry-run, apply}`.
+- **Root tier se dá ověřit z prootu**: `--runner ashell` (`ashell -c 'su -c …'`).
+  `su` v prootu nefunguje (magisk daemon nedostupný), `ashell -c` běží mimo
+  proot pod uid appky a `su -c` tam dá `uid=0 … u:r:magisk:s0`.
+- JVM testy (`ShellSession` protokol) jen v CI: `gradle :app:testDebugUnitTest`.
 - Testy mazání **nikdy** na reálných systémových datech — fixture stromy
   v `tmp_path`, `FakeShell` pro shell backendy.
 - Před tvrzením „funguje“ doložit: příkaz, výstup, exit code.
@@ -232,6 +265,10 @@ Fallback na `grep`/`git` jen když basemind nefunguje nebo je obsah mimo index
 - ❌ Nemazat „protože to je cache“ — ověřit, že to cache opravdu je a že patří nám.
 - ❌ Neměnit ownership (žádný `chown` na cizí data).
 - ❌ Nedávat objekt do JSON payloadu pro Chaquopy.
+- ❌ Nenabízet cleaner, který na daném tieru nemůže uspět — vypnout ho
+  s českým důvodem (`missing_labels`).
+- ❌ Nehlásit `0 B`, když velikost nejde zjistit (ADB tier nepřečte
+  `/data/data/<pkg>/cache`) — `Stats.size_known=False` a „neznámá velikost“.
 - ❌ Nepoužívat `pm clear --cache-only` na root tieru (smaže i bookkeeping
   package manageru; `su <uid> -c find -delete` je užší a bezpečnější).
 - ❌ Nedělat novou práci v jiné branchi než `master`.

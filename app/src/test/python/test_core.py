@@ -278,14 +278,21 @@ def test_adb_installed_packages_parses_pm_output():
     assert backend.installed_packages() == ["com.a", "com.b"]
 
 
-def test_root_backend_uses_su_runner():
-    shell = FakeShell({"su -c 'du": (0, "2048\t/x\n", "")})
+def test_root_backend_sends_plain_commands_to_its_runner():
+    """The runner is root, so commands must NOT be wrapped in `su -c`.
+
+    Regression: every command used to be re-wrapped in `su -c '...'`, which
+    spawned a fresh `su` process per command inside the persistent root shell
+    the Kotlin side keeps open exactly to avoid that.
+    """
+    shell = FakeShell({"du": (0, "2048\t/x\n", "")})
     backend = RootBackend(shell)
 
     stats = backend.delete("/data/system/dropbox/x")
 
     assert stats.bytes == 2048
-    assert all(c.startswith("su -c") for c in shell.calls)
+    assert shell.calls, "nothing reached the runner"
+    assert not any(c.startswith("su -c") for c in shell.calls), shell.calls
 
 
 def test_root_backend_clears_cache_as_the_apps_own_uid():
@@ -296,9 +303,9 @@ def test_root_backend_clears_cache_as_the_apps_own_uid():
     through `su <uid>`, so the filesystem sees the app's own uid.
     """
     shell = FakeShell({
-        "su -c 'stat": (0, "10316\n", ""),
-        "su -c 'du": (0, "150748\t/data/data/com.example/cache\n", ""),
-        "su -c 'am force-stop": (0, "", ""),
+        "stat": (0, "10316\n", ""),
+        "du": (0, "150748\t/data/data/com.example/cache\n", ""),
+        "am force-stop": (0, "", ""),
     })
     backend = RootBackend(shell)
 
@@ -318,7 +325,7 @@ def test_root_backend_clears_cache_as_the_apps_own_uid():
 
 
 def test_root_backend_refuses_app_without_data_directory():
-    shell = FakeShell({"su -c 'stat": (1, "", "No such file or directory")})
+    shell = FakeShell({"stat": (1, "", "No such file or directory")})
     backend = RootBackend(shell)
     with pytest.raises(BackendError):
         backend.clear_app_cache("com.gone")
@@ -696,3 +703,153 @@ def test_api_accepts_object_runner_with_run_method(roots, tree: Path):
         assert seen == [str(db)]
     finally:
         api._VACUUM_RUNNER = None
+
+
+# ---------------------------------------------------------------------------
+# non-root tier: the shared-storage grant and the whitelist move together
+# ---------------------------------------------------------------------------
+
+def _nonroot_payload(tree: Path, all_files: bool, cleaners: list[str]) -> str:
+    """An api payload shaped like the one PythonBridge builds on device."""
+    return json.dumps(
+        {
+            "mode": "nonroot",
+            "app_files": str(tree / "app"),
+            "app_cache": str(tree / "app" / "cache"),
+            "external": str(tree / "app" / "ext"),
+            "sdcard": str(tree / "sd"),
+            "android_media": str(tree / "sd"),
+            "all_files": all_files,
+            "cleaners": cleaners,
+            "dry_run": False,
+        }
+    )
+
+
+@pytest.fixture()
+def shared_tree(tmp_path: Path) -> Path:
+    """A fake /sdcard next to a fake app sandbox."""
+    (tmp_path / "app" / "cache").mkdir(parents=True)
+    (tmp_path / "app" / "ext").mkdir(parents=True)
+    thumbs = tmp_path / "sd" / "DCIM" / ".thumbnails"
+    thumbs.mkdir(parents=True)
+    (thumbs / "t.jpg").write_bytes(b"t" * 64)
+    ext_cache = tmp_path / "sd" / "Android" / "data" / "com.x" / "cache"
+    ext_cache.mkdir(parents=True)
+    (ext_cache / "c.bin").write_bytes(b"c" * 128)
+    return tmp_path
+
+
+def test_nonroot_without_all_files_access_does_not_offer_shared_storage(shared_tree: Path):
+    """Promising a clean we cannot perform is worse than saying we cannot.
+
+    Regression: the backend advertised ``shared_storage`` unconditionally while
+    its whitelist held only the app's own directories. Enumeration does not go
+    through the guard, so a scan found /sdcard and every delete then failed
+    with "outside allowed roots".
+    """
+    out = json.loads(api.list_cleaners(_nonroot_payload(shared_tree, False, [])))
+
+    assert out["backend"]["capabilities"] == ["app_data"]
+    by = {c["name"]: c for c in out["cleaners"]}
+    for name in ("thumbnails", "external_app_cache", "shared_databases"):
+        assert not by[name]["enabled"], name
+        assert "shared_storage" in by[name]["missing"], by[name]
+        assert by[name]["missing_labels"], "the UI needs a Czech reason"
+
+
+def test_nonroot_with_all_files_access_actually_deletes_in_shared_storage(shared_tree: Path):
+    payload = _nonroot_payload(
+        shared_tree, True, ["thumbnails", "external_app_cache"]
+    )
+
+    scanned = json.loads(api.scan(payload))
+    assert scanned["total_bytes"] == 64 + 128
+
+    report = json.loads(api.apply_clean(payload))
+    assert report["failed"] == 0, report["log"]
+    assert report["deleted"] == 2
+    assert report["freed_bytes"] == 64 + 128
+    assert not (shared_tree / "sd" / "DCIM" / ".thumbnails" / "t.jpg").exists()
+    assert not list((shared_tree / "sd" / "Android" / "data" / "com.x" / "cache").iterdir())
+
+
+# ---------------------------------------------------------------------------
+# empty files are still files
+# ---------------------------------------------------------------------------
+
+def test_zero_length_files_are_scanned_and_deleted(tree: Path, roots: dict[str, str]):
+    """Regression: a `size == 0` guard in scan() reported them and left them.
+
+    They were listed by the scan, so the user was told they would go, and then
+    every clean silently kept them forever.
+    """
+    (tree / "cache" / "empty.bin").write_bytes(b"")
+    backend = NonRootBackend([str(tree)])
+
+    scanned = engine.scan(backend, roots, ["app_cache"])
+    assert str(tree / "cache" / "empty.bin") in [e.path for e in scanned.entries]
+
+    engine.apply(backend, roots, ["app_cache"], dry_run=False)
+    assert not (tree / "cache" / "empty.bin").exists()
+
+
+# ---------------------------------------------------------------------------
+# databases: only where sqlite3 can run as the owner of the file
+# ---------------------------------------------------------------------------
+
+def test_foreign_databases_are_not_offered_on_any_tier():
+    """The bundled sqlite3 can only ever run as our own uid.
+
+    It lives in our filesDir (mode 0700) and the device ships no system
+    sqlite3, so VACUUMing another app's database would mean running as root
+    and leaving root-owned journal files in foreign app data — the failure this
+    project already paid for once. The cleaner must be withheld, not offered
+    and then failed.
+    """
+    for backend in (
+        RootBackend(FakeShell(), vacuum_runner=lambda path: (0, "", "")),
+        AdbBackend(FakeShell(), "/app", vacuum_runner=lambda path: (0, "", "")),
+    ):
+        assert backend.supports_sqlite
+        assert backend.can_vacuum([Capability.APP_DATA])
+        assert not backend.can_vacuum([Capability.OTHER_APP_DATA])
+
+        by = {c["name"]: c for c in engine.describe(backend)}
+        assert not by["other_databases"]["enabled"], backend.name
+        assert "sqlite3_as_owner" in by["other_databases"]["missing"]
+        # ...while our own databases stay available.
+        assert by["own_databases"]["enabled"], backend.name
+        assert "other_databases" not in [
+            s.name for s in engine.select_cleaners(backend)
+        ]
+
+
+def test_nonroot_vacuum_respects_the_whitelist(tmp_path: Path):
+    """Regression: `kind=sqlite` bypassed the root whitelist entirely.
+
+    `_SqliteMixin.vacuum_db` handed the path straight to the runner, so any
+    database the process could open was rewritable regardless of the roots the
+    backend was configured with (AGENTS.md §6/4).
+    """
+    outside = tmp_path / "outside.db"
+    outside.write_bytes(b"SQLite format 3\x00")
+    inside_root = tmp_path / "allowed"
+    inside_root.mkdir()
+    inside = inside_root / "ok.db"
+    inside.write_bytes(b"SQLite format 3\x00")
+
+    vacuumed: list[str] = []
+
+    def runner(path: str):
+        vacuumed.append(path)
+        return 0, "", ""
+
+    backend = NonRootBackend([str(inside_root)], vacuum_runner=runner)
+
+    backend.vacuum_db(str(inside))
+    assert vacuumed == [str(inside)]
+
+    with pytest.raises(BackendError):
+        backend.vacuum_db(str(outside))
+    assert vacuumed == [str(inside)], "the runner must not even be called"

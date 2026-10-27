@@ -19,12 +19,13 @@
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
 
-    <!-- Long scans must survive the user leaving the app. -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!--
+      No FOREGROUND_SERVICE / POST_NOTIFICATIONS / WAKE_LOCK /
+      RECEIVE_BOOT_COMPLETED here on purpose: there is no service and no
+      notification in this app yet. They were declared for a foreground
+      service that was never written, so the install asked for privileges
+      nothing used. They come back together with the service that needs them.
+    -->
 
     <!-- Only for the usage-stats cleaner (which apps are unused). -->
     <uses-permission

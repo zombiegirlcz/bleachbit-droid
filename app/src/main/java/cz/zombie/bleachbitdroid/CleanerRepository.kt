@@ -19,6 +19,8 @@ data class CleanerItem(
     val requires: List<String>,
     val enabled: Boolean,
     val missing: List<String>,
+    /** Why it cannot run, in Czech; the raw [missing] tokens are internal. */
+    val missingLabels: List<String>,
     val kind: String,
     val unusedDays: Int,
 )
@@ -42,6 +44,8 @@ data class CleanSummary(
     val freedBytes: Long,
     val deleted: Int,
     val failed: Int,
+    /** Cleared successfully, but the tier could not measure how much. */
+    val unknown: Int,
     val logLines: List<String>,
 )
 
@@ -73,6 +77,8 @@ object CleanerRepository {
                 requires = o.getJSONArray("requires").toStringList(),
                 enabled = o.getBoolean("enabled"),
                 missing = o.getJSONArray("missing").toStringList(),
+                missingLabels = o.optJSONArray("missing_labels")?.toStringList()
+                    ?: o.getJSONArray("missing").toStringList(),
                 kind = o.optString("kind", "path"),
                 unusedDays = o.optInt("unused_days", 0),
             )
@@ -134,6 +140,7 @@ object CleanerRepository {
             freedBytes = json.getLong("freed_bytes"),
             deleted = json.getInt("deleted"),
             failed = json.getInt("failed"),
+            unknown = json.optInt("unknown", 0),
             logLines = lines,
         )
     }

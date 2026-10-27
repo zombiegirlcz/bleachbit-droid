@@ -76,8 +76,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         ShizukuRunner.startListeners()
 
         // Register the VACUUM bridge *before* any reload: `supports_sqlite` is
-        // derived from whether a runner was injected, and the synchronous
-        // reload() below runs before the IO coroutine finishes. Without this
+        // derived from whether a runner was injected, and the reload() below
+        // asks the registry straight away. Without this
         // the UI listed own_databases as "missing sqlite3" even though the
         // bundled sqlite3 works (GuestSelfTest proves it a moment later).
         // Registration itself touches no disk; VacuumRunner re-checks
@@ -89,15 +89,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) {
             RootfsInstaller.ensure(context)
             GuestSelfTest.run(context)
-            detectModes()
-            reload()
         }
 
-        // Detect modes first so the UI is usable immediately. The root probe
-        // spawns `su`, which blocks on a Magisk prompt until the user answers.
-        detectModes()
+        // Exactly once each. This used to call detectModes() and reload()
+        // twice - here and again at the end of the IO block above - which did
+        // all the Python work twice at startup and, worse, the late reload()
+        // reset `selected`, so a cleaner the user had just unticked came back
+        // checked a second later.
+        reload(resetSelection = true)
+        // Ends with detectModes(); the root probe spawns `su`, which blocks on
+        // a Magisk prompt until the user answers, so it stays off the main
+        // thread.
         refreshPermissions()
-        reload()
     }
 
     /**
@@ -141,12 +144,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun hasAllFilesAccess(): Boolean =
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
-            android.os.Environment.isExternalStorageManager()
-        } else {
-            true
-        }
 
     fun onShizukuPermissionResult(granted: Boolean) {
         if (granted) {
@@ -155,7 +152,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         refreshPermissions()
-        reload()
+        reload(resetSelection = true)
     }
 
     private fun detectModes() {
@@ -195,33 +192,46 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _state.update {
                     it.copy(mode = mode, scan = null, clean = null, selected = emptySet())
                 }
-                reload()
+                reload(resetSelection = true)
             }
             return
         }
         _state.update { it.copy(mode = mode, scan = null, clean = null, selected = emptySet()) }
-        reload()
+        reload(resetSelection = true)
     }
 
-    fun reload() {
+    /**
+     * Re-read the cleaner registry for the current tier.
+     *
+     * [resetSelection] is for the cases where the old selection has no
+     * meaning any more — app start and a tier switch. Otherwise the selection
+     * survives: a reload triggered by `onResume` used to silently re-check
+     * every default, so a cleaner the user had just unticked came back.
+     */
+    fun reload(resetSelection: Boolean = false) {
         viewModelScope.launch {
             _state.update { it.copy(phase = Phase.LOADING, error = null, message = null) }
             try {
                 val mode = _state.value.mode
                 val (backend, cleaners) = CleanerRepository.cleaners(context, mode)
-                _state.update {
-                    it.copy(
+                _state.update { current ->
+                    // HIGH-risk cleaners start unchecked. They are shared
+                    // scratch space someone put there on purpose (or a
+                    // one-off dataset), so the user must opt in explicitly
+                    // instead of losing it to a stray tap on "Vyčistit".
+                    val default = cleaners
+                        .filter { c -> c.enabled && c.risk != "high" }
+                        .map { c -> c.name }
+                        .toSet()
+                    // A reload must not undo the user's ticks; it only drops
+                    // names that this tier cannot run any more.
+                    val enabled = cleaners.filter { it.enabled }.map { it.name }.toSet()
+                    val keep = current.selected intersect enabled
+                    current.copy(
                         phase = Phase.IDLE,
                         backend = backend,
                         cleaners = cleaners,
-                        // HIGH-risk cleaners start unchecked. They are shared
-                        // scratch space someone put there on purpose (or a
-                        // one-off dataset), so the user must opt in explicitly
-                        // instead of losing it to a stray tap on "Vyčistit".
-                        selected = cleaners
-                            .filter { c -> c.enabled && c.risk != "high" }
-                            .map { c -> c.name }
-                            .toSet(),
+                        selected = if (resetSelection) default else keep,
                     )
                 }
             } catch (t: Throwable) {
@@ -317,10 +327,23 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         phase = Phase.IDLE,
                         clean = summary,
                         progressTitle = null,
-                        message = if (dryRun) {
-                            "Zkušební režim: uvolnilo by se ${formatBytes(summary.freedBytes)}"
-                        } else {
-                            "Uvolněno ${formatBytes(summary.freedBytes)} (${summary.deleted} souborů)"
+                        message = buildString {
+                            if (dryRun) {
+                                append("Zkušební režim: uvolnilo by se ")
+                                append(formatBytes(summary.freedBytes))
+                            } else {
+                                append("Uvolněno ${formatBytes(summary.freedBytes)}")
+                                append(" (${summary.deleted} souborů)")
+                            }
+                            // The ADB tier clears app caches without being able
+                            // to measure them, so saying just "0 B" would be a
+                            // lie; say what we know and what we do not.
+                            if (summary.unknown > 0) {
+                                append(" + ${summary.unknown} položek neznámé velikosti")
+                            }
+                            if (summary.failed > 0) {
+                                append(", ${summary.failed} selhalo")
+                            }
                         },
                     )
                 }

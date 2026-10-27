@@ -28,6 +28,13 @@ class ProgressSink(
                     path = o.optString("path", ""),
                     bytes = o.optLong("bytes", 0L),
                     totalBytes = o.optLong("total_bytes", 0L),
+                    // `done` reports what the clean actually freed, and the
+                    // package tiers report whether that number is even
+                    // knowable. Both were missing here, so the last line of
+                    // every clean read "Uvolněno 0 B".
+                    freedBytes = o.optLong("freed_bytes", 0L),
+                    sizeKnown = o.optBoolean("size_known", true),
+                    unknown = o.optInt("unknown", 0),
                     entries = o.optInt("entries", 0),
                     index = o.optInt("index", 0),
                     total = o.optInt("total", 0),
@@ -52,6 +59,9 @@ data class ProgressEvent(
     val path: String = "",
     val bytes: Long = 0L,
     val totalBytes: Long = 0L,
+    val freedBytes: Long = 0L,
+    val sizeKnown: Boolean = true,
+    val unknown: Int = 0,
     val entries: Int = 0,
     val index: Int = 0,
     val total: Int = 0,
@@ -62,16 +72,24 @@ data class ProgressEvent(
     fun render(): String = when (type) {
         "scan_start" -> "Prohledávám…"
         "cleaner_start" -> "• ${description.ifEmpty { cleaner }}"
-        "cleaner_done" -> "  → ${cleaner}: ${formatBytes(totalBytes)} (${entries}×)"
+        // `bytes` here is this cleaner's own share, not the running total.
+        "cleaner_done" -> "  → ${cleaner}: ${formatBytes(bytes)} (${entries}×)"
         "scan_done" -> "Hotovo: ${formatBytes(totalBytes)} v ${entries} položkách"
         "start" -> "Spouštím čištění…"
-        "scanned" -> "Nalezeno ${entries} položek (${formatBytes(totalBytes)})"
+        "scanned" -> "Nalezeno ${entries} položek (${formatBytes(bytes)})"
         "found" -> "  + ${shortPath(path)} (${formatBytes(bytes)})"
         "would_delete" -> "  ~ ${shortPath(path)} (${formatBytes(bytes)})"
-        "deleted" -> "  − ${shortPath(path)} (${formatBytes(bytes)})"
+        "deleted" ->
+            if (sizeKnown) "  − ${shortPath(path)} (${formatBytes(bytes)})"
+            else "  − ${shortPath(path)} (velikost neznámá)"
         "skip" -> "  ! přeskočeno ${shortPath(path)}: $reason"
         "failed" -> "  ✗ ${shortPath(path)}: $reason"
-        "done" -> "Uvolněno ${formatBytes(totalBytes)}"
+        "done" ->
+            if (unknown > 0) {
+                "Uvolněno ${formatBytes(freedBytes)} + $unknown položek neznámé velikosti"
+            } else {
+                "Uvolněno ${formatBytes(freedBytes)}"
+            }
         else -> "$type ${shortPath(path)}".trim()
     }
 

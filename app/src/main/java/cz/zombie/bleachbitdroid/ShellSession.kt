@@ -33,7 +33,10 @@ data class ShellResult(val code: Int, val stdout: String, val stderr: String) {
  * ```
  * stderr is folded into stdout so the output keeps its order; every line before
  * the marker is the command's output, the number after the marker is its exit
- * code. The reader thread appends everything to [buffer] and [exec] waits for
+ * code. A command must not contain a bare `exit`: inside the brace group it
+ * would terminate the session's own shell and the marker would never arrive
+ * (verified against a real `sh`). Backends only ever send probes and
+ * `find`/`stat`/`rm`, so this is a note for whoever adds the next one. The reader thread appends everything to [buffer] and [exec] waits for
  * the marker to appear.
  *
  * Thread-safe: [execLock] serializes commands, so concurrent callers queue up
@@ -50,9 +53,6 @@ class ShellSession(
     private var process: Process? = null
     private var stdin: OutputStream? = null
     private var seq = 0
-
-    @Volatile
-    private var closed = false
 
     private fun start() {
         val p = factory()
@@ -86,7 +86,14 @@ class ShellSession(
     /** Run one command, returning its output and exit code. */
     fun exec(command: String, timeoutSec: Long = DEFAULT_TIMEOUT_SEC): ShellResult =
         execLock.withLock {
-            if (closed) return ShellResult(-1, "", "session closed")
+            // No "closed" latch here, deliberately. There used to be one, set
+            // by [close] and never cleared, so the first timeout, the first
+            // exception, a failed root probe or a dead Shizuku binder made
+            // every later command return "session closed" for the rest of the
+            // process' life — the whole tier stayed dead until the app was
+            // restarted, despite [close]'s promise below. A closed session is
+            // simply one without a process, and the next command starts a new
+            // one.
             try {
                 if (process == null) start()
                 val id = ++seq
@@ -132,7 +139,6 @@ class ShellSession(
     /** Drop the shell; the next [exec] starts a fresh one. */
     fun close() {
         execLock.withLock {
-            closed = true
             val p = process
             process = null
             stdin = null

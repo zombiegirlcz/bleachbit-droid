@@ -38,7 +38,10 @@ python3 -m bleachbit_droid.cli scan   --mode adb --runner nh-adb --cleaners app_
 python3 -m bleachbit_droid.cli clean  --mode root --runner su --dry-run
 ```
 
-Runnery: `local` (`sh -c`), `nh-adb` (`nh adb shell`), `su` (`su 0 -c`).
+Runnery: `local` (`sh -c`), `nh-adb` (`nh adb shell`), `su` (`su 0 -c`),
+**`ashell`** (`ashell -c 'su -c …'` — root tier přímo z prootu; `su` v prootu
+nefunguje, magisk daemon tam není vidět). `--no-shared-storage` simuluje
+non-root tier bez all-files oprávnění.
 Pro VACUUM: `--loader` + `--rootfs` (vestavěný toolchain), `--sqlite3` (systémový),
 `--no-sqlite` (negativní test).
 
@@ -46,14 +49,19 @@ Pro VACUUM: `--loader` + `--rootfs` (vestavěný toolchain), `--sqlite3` (systé
 
 `app_data` < `shared_storage` < `other_app_data` < `system`
 
-| backend | capabilities | `supports_packages` | `supports_sqlite` |
+| backend | capabilities | `supports_packages` | VACUUM (`vacuum_capabilities`) |
 |---|---|---|---|
-| `nonroot` | app_data, shared_storage | ne | ano (když je injectnut runner) |
-| `adb` | + other_app_data | ano | ano |
-| `root` | vše | ano | ano |
+| `nonroot` | app_data (+ shared_storage **jen s all-files**) | ne | app_data, shared_storage |
+| `adb` | + other_app_data | ano | app_data, shared_storage |
+| `root` | vše | ano | app_data, shared_storage |
 
 Cleaner se spustí jen když `requires ⊆ backend.capabilities`
-(a u `kind=package` navíc `supports_packages`, u `kind=sqlite` `supports_sqlite`).
+(a u `kind=package` navíc `supports_packages`, u `kind=sqlite`
+`backend.can_vacuum(requires)`).
+
+`shared_storage` na non-root tieru se odvozuje z `all_files` v payloadu
+(`Environment.isExternalStorageManager()`), protože bez toho oprávnění proces
+`/sdcard` vyjmenuje, ale nic v něm nesmaže.
 
 ### Tři druhy cleanerů
 
@@ -134,7 +142,7 @@ v `CleanerScreen` (monospace, auto-scroll na konec, max 200 řádků).
 | `other_app_cache` | package | other_app_data | medium | ~300 MB |
 | `unused_app_cache` | package (30 dní) | other_app_data | low | — |
 | `own_databases` | sqlite | app_data | low | — |
-| `other_databases` | sqlite | other_app_data | medium | ~14 MB |
+| `other_databases` | sqlite | other_app_data | medium | **nenabízí se** (viz níže) |
 | `logcat_dumps` | path | system | medium | ~10 MB |
 | `dalvik_cache` | path (`/data/dalvik-cache/{arm64,arm}`) | system | medium | **851 MB** |
 | `app_code_cache` | path (`*/code_cache`) | system | low | ~70 kB |
@@ -185,7 +193,8 @@ cd app && python3 -m pytest src/test/python -q
 
 Soubory: `test_core.py`, `test_enumeration.py`, `test_progress.py`.
 
-**Aktuální stav: 107 passed, 1 skipped.**
+**Aktuální stav: 128 passed** (Python) + 7 JVM testů `ShellSessionTest`
+(`gradle :app:testDebugUnitTest`, běží v CI — lokálně gradle nejde).
 
 Pokrývají mimo jiné:
 - metadata cleanerů, capability gating, guardy backendů, package-name validace
@@ -209,20 +218,68 @@ Pokrývají mimo jiné:
 - `uiautomator dump` dává Compose textům nulové bounds → používat klikatelné parenty
 - `dd` v `nh adb shell` tiše selhává → `head -c N /dev/zero > soubor`
 
+## Opravy z analýzy funkčnosti (2026-10-27)
+
+Všechno níže má regresní test; co šlo, je ověřené na zařízení přes
+`--runner ashell`.
+
+| co bylo rozbité | oprava | doklad |
+|---|---|---|
+| non-root tier nesmazal **nic** ve sdíleném úložišti (scan našel, apply spadl „outside allowed roots“ na každém souboru) | `shared_storage` se odvozuje z `all_files`; s oprávněním jsou `/sdcard` a `/data/media/0` ve whitelistu | `test_nonroot_*_shared_storage`; CLI: 2 soubory smazány, 0 failed |
+| apply = 4 shell příkazy na soubor | `delete_many()`, dávky po 200 | 20 souborů **82 → 3** příkazy; na zařízení 41 souborů = **1** `rm` |
+| `ShellSession.close()` nevratné → první timeout zabil tier do restartu | latch `closed` zrušen | `ShellSessionTest` (JVM) |
+| `other_databases` se nabízel, ale VACUUM cizí db nemůže uspět | `vacuum_capabilities`, cleaner vypnut s důvodem | `test_foreign_databases_are_not_offered_on_any_tier` |
+| nulové soubory se ohlásily a nikdy nesmazaly | `size == 0` guard pryč | `test_zero_length_files_are_scanned_and_deleted` |
+| „Nalezeno N (0 B)“ a „Uvolněno 0 B“ | `ProgressSink` čte `bytes`/`freed_bytes`/`unknown` | `test_done_event_carries_what_was_freed` |
+| `cleaner_done` hlásil kumulativní součet jako podíl cleaneru | `bytes` = podíl cleaneru | `test_cleaner_done_reports_only_its_own_share` |
+| apply nehlásil průběh během scanu (nejdelší fáze) | `on_event` se předává do `scan()` | `test_apply_reports_the_scan_it_runs` |
+| ADB tier hlásil `0 B` po úspěšném `pm clear` | `Stats.size_known`, `CleanReport.unknown`, „+ N položek neznámé velikosti“ | `test_package_clear_without_a_measurable_size_is_reported_as_unknown` |
+| `unused_app_cache` prakticky nikdy nic nevrátil (dotaz jen do okna N dní) | všechny retained intervaly od 0, chybějící záznam = nepoužito, jen spustitelné appky | — (vyžaduje zařízení s usage access) |
+| `RootBackend` obaloval každý příkaz `su -c` uvnitř root shellu | runner je root, příkazy jdou nezabalené | `test_root_backend_sends_plain_commands_to_its_runner`; na zařízení ověřeno |
+| VACUUM obcházel whitelist non-root tieru | `NonRootBackend.vacuum_db` guarduje | `test_nonroot_vacuum_respects_the_whitelist` |
+| `missing` se uživateli zobrazoval jako `other_app_data, shell` | `missing_labels` v češtině | CLI: „chybí: Data jiných aplikací, přístup k shellu“ |
+| „Vyčistit“ mazalo bez potvrzení | `AlertDialog` s počtem čističů, nálezem a HIGH-risk varováním | — |
+| `detectModes()`+`reload()` běžely 2× při startu a pozdní reload přepsal výběr | jednou; `reload(resetSelection)` | — |
+| manifest žádal FGS / notifikace / wake lock / boot, které nic nepoužívá | oprávnění pryč, vrátí se se službou | manifest |
+| `.gitignore` měl slepenou řádku `ktlintapkmanifest.xml`, `apkmanifest.xml` byl commitnutý | řádka opravena, soubor odtrackován | `git check-ignore` |
+
+### Ověřeno na zařízení (root tier, `--runner ashell`, 2026-10-27)
+
+- `detect` → `uid=0(root) … context=u:r:magisk:s0`
+- scan `dalvik_cache,package_cache,profile_snapshots,logcat_dumps` →
+  **901,1 MB v 2031 položkách** za 5,3 s (`du -sb /data/dalvik-cache`
+  = 871 419 576 B, souhlasí)
+- dry-run `package_cache,profile_snapshots` → 17,6 MB
+- reálné mazání na vlastním stromu `/data/local/tmp/bb-selftest`: 41 souborů
+  (včetně nulového) **jedním** `rm`, 0 selhání, adresář i vlastník zůstali
+- VACUUM přes engine: 3,3 MB → 8,2 kB, `integrity_check = ok`, freelist 0
+- toybox 0.8.6: `du -b`, `stat -c %u`, `stat -c '%s<TAB>%n'` s `-exec +`,
+  `find -path`, `find -mindepth 1 -delete` — vše funguje
+- `/system/bin/sqlite3` na zařízení **není** (ani v xbin, ani v apexu)
+
 ## Známé limity / TODO
 
 1. APK se staví jen v CI; artefakt `bleachbit-droid-debug`.
-2. `local.properties` a `apkmanifest.xml` jsou v `.gitignore`.
-3. **Foreground service pro apply neexistuje** — manifest ho deklaruje, ale
-   služba není. Dlouhá čistka na pozadí může být zabita (MIUI hibernace to
-   reálně dělá).
+2. `local.properties` a `apkmanifest.xml` jsou v `.gitignore` (řádka opravena,
+   `apkmanifest.xml` odtrackován).
+3. **Foreground service pro apply stále neexistuje** — a manifest ho už ani
+   nepředstírá (oprávnění odstraněna). Dlouhá čistka na pozadí může být zabita
+   (MIUI hibernace to reálně dělá). Služba + notifikace = další krok.
 4. Usage stats vyžadují ruční povolení; bez něj se `unused_app_cache` přeskočí.
-5. All-files-access vyžaduje ruční povolení.
+   Nová logika (všechny intervaly) není ověřená na zařízení s povoleným
+   usage access.
+5. All-files-access vyžaduje ruční povolení — bez něj non-root tier nabízí
+   jen `app_cache` a `own_databases`, a říká proč.
 6. Shizuku manager na testovacím zařízení není nainstalovaný; běží jen
    `shizuku_server` (compat server). ADB tier funguje, `pm clear` ověřen zvlášť.
-7. `staging_tmp` je HIGH risk a ve výchozím výběru být nemá.
+7. `staging_tmp` je HIGH risk, ve výchozím výběru není a potvrzovací dialog ho
+   vypíše zvlášť.
 8. Chybí: notifikace o průběhu, golden reference z fáze 0, skutečné zbytky
-   po odinstalovaných appkách (chce porovnání se seznamem balíčků).
+   po odinstalovaných appkách (chce porovnání se seznamem balíčků),
+   ikona aplikace (`bb.png` není v `res/`), VACUUM cizích databází (chtělo by
+   `sqlite3` spustitelný pod uid vlastníka).
+9. Kotlin kód se lokálně nedá zkompilovat (aapt2 x86-64, chybí truststore) —
+   změny v Kotlinu ověří až CI.
 
 ## Historie
 

@@ -85,7 +85,16 @@ def _backend(data: dict[str, Any]):
         return AdbBackend(runner, roots["app_files"], vacuum_runner=vacuum)
     if mode == "nonroot":
         allowed = [p for p in (roots["app_files"], roots["app_cache"], roots["external"]) if p]
-        return NonRootBackend(allowed, vacuum_runner=vacuum)
+        # Shared storage is only reachable with MANAGE_EXTERNAL_STORAGE. The
+        # whitelist used to hold the app's own three directories only, while
+        # the backend advertised `shared_storage` regardless — so `thumbnails`
+        # and `external_app_cache` (the two that actually hold hundreds of
+        # megabytes) were scanned and then failed on every file with
+        # "outside allowed roots". Grant and capability now move together.
+        shared = bool(data.get("all_files"))
+        if shared:
+            allowed += [p for p in (roots["sdcard"], roots["android_media"]) if p]
+        return NonRootBackend(allowed, vacuum_runner=vacuum, shared_storage=shared)
     raise BackendError(f"unknown mode {mode!r}")
 
 

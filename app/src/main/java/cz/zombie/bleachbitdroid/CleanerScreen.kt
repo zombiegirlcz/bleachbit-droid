@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -34,6 +35,9 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -60,6 +64,47 @@ private fun riskLabel(risk: String): String = when (risk) {
 fun CleanerScreen(viewModel: MainViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
+
+    // Deleting is irreversible and the root tier reaches system directories,
+    // so "Vyčistit" asks first. "Prohledat" and "Zkusmo" change nothing and
+    // stay one tap away.
+    var confirming by remember { mutableStateOf(false) }
+
+    if (confirming) {
+        val risky = state.cleaners.filter { it.name in state.selected && it.risk == "high" }
+        AlertDialog(
+            onDismissRequest = { confirming = false },
+            title = { Text("Smazat nalezené soubory?") },
+            text = {
+                Column {
+                    Text(
+                        "Spustí se ${state.selectedCleaners.size} čističů na úrovni " +
+                            "${modeLabel(state.mode)}. Mazání nelze vzít zpět.",
+                    )
+                    state.scan?.let {
+                        Spacer(Modifier.height(8.dp))
+                        Text("Poslední prohledání našlo ${formatBytes(it.totalBytes)}.")
+                    }
+                    if (risky.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "Vysoké riziko: ${risky.joinToString { it.name }}",
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirming = false
+                    viewModel.clean(dryRun = false)
+                }) { Text("Vyčistit") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirming = false }) { Text("Zrušit") }
+            },
+        )
+    }
 
     Scaffold(
         topBar = { TopAppBar(title = { Text("BleachBit Droid") }) },
@@ -88,7 +133,7 @@ fun CleanerScreen(viewModel: MainViewModel) {
                 ) { Text("Zkusmo") }
 
                 Button(
-                    onClick = { viewModel.clean(dryRun = false) },
+                    onClick = { confirming = true },
                     enabled = ready,
                     modifier = Modifier.weight(1f),
                 ) {
@@ -262,7 +307,7 @@ private fun CleanerRow(cleaner: CleanerItem, checked: Boolean, onToggle: () -> U
             Text(cleaner.description, style = MaterialTheme.typography.bodyLarge)
             Text(
                 "${cleaner.name} • ${riskLabel(cleaner.risk)}" +
-                    if (!cleaner.enabled) " • chybí: ${cleaner.missing.joinToString()}" else "",
+                    if (!cleaner.enabled) " • chybí: ${cleaner.missingLabels.joinToString()}" else "",
                 style = MaterialTheme.typography.bodySmall,
             )
         }

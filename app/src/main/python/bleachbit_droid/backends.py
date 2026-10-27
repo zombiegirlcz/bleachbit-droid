@@ -31,6 +31,11 @@ class BackendError(RuntimeError):
 class Stats:
     files: int = 0
     bytes: int = 0
+    #: False when the backend could not measure what it removed. The ADB tier
+    #: cannot read /data/data/<pkg>/cache (uid 2000 gets EACCES, verified on
+    #: device), so reporting 0 B there would be a lie the UI then printed as
+    #: "Uvolněno 0 B" after successfully clearing hundreds of megabytes.
+    size_known: bool = True
 
 
 class PrivilegeBackend(ABC):
@@ -43,10 +48,29 @@ class PrivilegeBackend(ABC):
     #: database operations need the bundled glibc sqlite3; overridden as a
     #: property by _SqliteMixin
     supports_sqlite: bool = False
+    #: Which capabilities' databases this backend may actually rebuild.
+    #:
+    #: The bundled sqlite3 lives inside *our* app's filesDir (mode 0700) and
+    #: can only ever run as our own uid, and the device ships no system
+    #: sqlite3 (verified: nothing in /system/bin, /system/xbin or the runtime
+    #: apex). So even the root tier cannot VACUUM another app's database as
+    #: that app's uid — and doing it as root would leave root-owned journal
+    #: files in foreign app data, which is the exact failure this project
+    #: already paid for once (AGENTS.md §6/2). Those cleaners are therefore
+    #: not offered at all instead of being offered and failing.
+    vacuum_capabilities: frozenset[Capability] = frozenset(
+        {Capability.APP_DATA, Capability.SHARED_STORAGE}
+    )
 
     # --- introspection -------------------------------------------------
     def can(self, cap: Capability) -> bool:
         return cap in self.capabilities
+
+    def can_vacuum(self, requires: Iterable[Capability]) -> bool:
+        """True when a ``kind=sqlite`` cleaner needing ``requires`` can run."""
+        if not self.supports_sqlite:
+            return False
+        return all(cap in self.vacuum_capabilities for cap in requires)
 
     def to_dict(self) -> dict:
         return {
@@ -126,6 +150,31 @@ class PrivilegeBackend(ABC):
                 except (BackendError, OSError):
                     continue
         return out
+
+    # --- bulk deletion -------------------------------------------------
+    def delete_many(self, entries: list[tuple[str, int]]) -> dict[str, str]:
+        """Delete several already-measured entries at once.
+
+        ``entries`` is ``(path, size)`` as ``engine.scan`` measured it. The
+        return value maps every path to ``""`` when it was removed or to a
+        failure reason when it was not, so the caller can still log one line
+        per file.
+
+        Why this exists: the per-file ``delete()`` path costs four shell
+        commands on a shell backend (``du``, ``test -f``, ``test -d``, ``rm``),
+        so clearing /data/dalvik-cache meant thousands of round trips even
+        though the scan had already measured every file in two commands.
+        Backends that can delete in bulk override this; the default keeps the
+        old behaviour for the local tier, where a syscall is free.
+        """
+        results: dict[str, str] = {}
+        for path, _size in entries:
+            try:
+                self.delete(path)
+                results[path] = ""
+            except (BackendError, OSError) as exc:
+                results[path] = str(exc)
+        return results
 
     # --- packages ------------------------------------------------------
     def clear_app_cache(self, package: str, force_stop: bool = True) -> Stats:
@@ -345,6 +394,48 @@ class _ShellMixin:
             result.append((path, size))
         return result
 
+    #: Paths per `rm` command. Long enough to amortise the round trip, short
+    #: enough to stay well under the kernel's argument limit even with the
+    #: long paths under /data/data.
+    DELETE_BATCH = 200
+
+    def delete_many(self, entries: list[tuple[str, int]]) -> dict[str, str]:
+        """Remove many files with one ``rm`` per batch.
+
+        The scan already measured every file, so there is nothing left to ask
+        the device: the only thing needed is the removal itself. A batch that
+        reports failure is retried file by file, because `rm` tells us only
+        that *something* in the batch could not be removed, and the log has to
+        name the file that actually failed.
+        """
+        results: dict[str, str] = {}
+        batch: list[str] = []
+
+        def flush() -> None:
+            if not batch:
+                return
+            args = " ".join(shell_quote(p) for p in batch)
+            code, out, err = self._run_raw(f"rm -f -- {args}")
+            if code == 0:
+                for path in batch:
+                    results[path] = ""
+            else:
+                # Pinpoint the failures; `rm` exits non-zero for the whole
+                # batch even when a single file was undeletable.
+                for path in batch:
+                    one, out1, err1 = self._run_raw(f"rm -f -- {shell_quote(path)}")
+                    results[path] = "" if one == 0 else (
+                        err1.strip() or out1.strip() or f"rm exit {one}"
+                    )
+            batch.clear()
+
+        for path, _size in entries:
+            batch.append(path)
+            if len(batch) >= self.DELETE_BATCH:
+                flush()
+        flush()
+        return results
+
     def count_leaves(self, path: str) -> Stats:
         """Count the files under ``path`` as the shell sees them.
 
@@ -356,9 +447,15 @@ class _ShellMixin:
     def clear_app_cache(self, package: str, force_stop: bool = True) -> Stats:
         pkg = _validate_package(package)
         before = 0
+        # uid 2000 cannot even traverse /data/data/<pkg> (verified on device:
+        # `su 2000 -c du -sk /data/data/com.android.vending/cache` -> EACCES),
+        # so the size stays *unknown* rather than silently becoming zero.
+        known = False
         try:
             out = self._shell(f"du -sk -- /data/data/{pkg}/cache 2>/dev/null")
-            before = int(out.split()[0]) * 1024 if out.strip() else 0
+            if out.strip():
+                before = int(out.split()[0]) * 1024
+                known = True
         except (BackendError, ValueError, IndexError):
             before = 0
 
@@ -370,7 +467,7 @@ class _ShellMixin:
                 pass
 
         self._shell(f"pm clear --cache-only {pkg}")
-        return Stats(files=0, bytes=before)
+        return Stats(files=0, bytes=before, size_known=known)
 
     def installed_packages(self) -> list[str]:
         out = self._shell("pm list packages")
@@ -432,13 +529,36 @@ class _SqliteMixin:
 # ---------------------------------------------------------------------------
 
 class NonRootBackend(_SqliteMixin, PrivilegeBackend):
-    name = "nonroot"
-    capabilities = frozenset({Capability.APP_DATA, Capability.SHARED_STORAGE})
+    """Our own app data, plus shared storage when the app may actually reach it.
 
-    def __init__(self, allowed_roots: Iterable[str], vacuum_runner=None) -> None:
+    ``shared_storage`` is not a constant here, and that was a real bug: the
+    class used to advertise ``SHARED_STORAGE`` unconditionally while the
+    whitelist only ever held the app's own three directories. Enumeration does
+    not go through ``_guard()``, so a scan happily found /sdcard/DCIM/.thumbnails
+    and every single delete then failed with "outside allowed roots" — the
+    default tier could not clean the two cleaners worth hundreds of megabytes.
+
+    The capability now follows the roots the backend was actually given, so the
+    UI shows "chybí: sdílené úložiště" (with its existing button to grant
+    all-files access) instead of promising a clean that cannot happen.
+    """
+
+    name = "nonroot"
+    capabilities = frozenset({Capability.APP_DATA})
+
+    def __init__(
+        self,
+        allowed_roots: Iterable[str],
+        vacuum_runner=None,
+        shared_storage: bool = False,
+    ) -> None:
         # Empty is allowed: introspection works, every guarded access is denied.
         self._roots = [os.path.realpath(r) for r in allowed_roots if r]
         self._vacuum = vacuum_runner
+        self.capabilities = frozenset(
+            {Capability.APP_DATA}
+            | ({Capability.SHARED_STORAGE} if shared_storage else set())
+        )
 
     def _vacuum_runner(self):
         if self._vacuum is None:
@@ -466,6 +586,16 @@ class NonRootBackend(_SqliteMixin, PrivilegeBackend):
             return os.path.lexists(self._guard(path))
         except BackendError:
             return False
+
+    def vacuum_db(self, path: str) -> Stats:
+        """Rebuild a database, but only inside the allowed roots.
+
+        ``_SqliteMixin.vacuum_db`` hands the path straight to the injected
+        runner, so without this override the whitelist (AGENTS.md §6/4) held
+        for ``delete()`` and not for ``kind=sqlite``: any database the process
+        could open was rewritable regardless of the configured roots.
+        """
+        return _SqliteMixin.vacuum_db(self, self._guard(path))
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +677,8 @@ class RootBackend(_SqliteMixin, _ShellMixin, PrivilegeBackend):
     ``su`` runner supplied by the Kotlin side.
 
     In Chaquopy ``os.geteuid()`` is never 0, so on a rooted device the Kotlin
-    side passes a runner that prefixes commands with ``su -c``.
+    side passes a runner that is *already* root — one persistent ``su`` shell
+    that every command is written into. Commands therefore go out unwrapped.
 
     The SQLite mixin is inherited here as well: without it the root tier
     advertised every database cleaner as "missing: sqlite3", even though the
@@ -589,8 +720,14 @@ class RootBackend(_SqliteMixin, _ShellMixin, PrivilegeBackend):
     def exists(self, path: str) -> bool:
         if self._runner is None:
             return os.path.lexists(path)
-        code, _, _ = self._runner.run(f"su -c {shell_quote('test -e ' + shell_quote(path))}")
+        code, _, _ = self._run_raw(f"test -e {shell_quote(path)}")
         return code == 0
+
+    def delete_many(self, entries: list[tuple[str, int]]) -> dict[str, str]:
+        """Batch through the shell, or fall back to syscalls when already root."""
+        if self._runner is None:
+            return PrivilegeBackend.delete_many(self, entries)
+        return _ShellMixin.delete_many(self, entries)
 
     # -- package ops ----------------------------------------------------
     def package_uid(self, package: str) -> int | None:
@@ -655,15 +792,24 @@ class RootBackend(_SqliteMixin, _ShellMixin, PrivilegeBackend):
             )
         return Stats(files=0, bytes=before)
 
+    # The runner is the thing that is root, not the command.
+    #
+    # This used to wrap every single command in `su -c '...'`, but the Kotlin
+    # runner keeps one persistent `su` shell alive (ShellSession) precisely so
+    # that a scan does not spawn a process per command — and the wrapper put
+    # that process back, one `su` exec for every `test -e`. Whoever supplies
+    # the runner is responsible for it being root; `detect()` verifies it with
+    # `id`, and the one place that deliberately drops privileges
+    # (`clear_app_cache`) still spells out `su <uid> -c` itself.
     def _run_raw(self, command: str) -> tuple[int, str, str]:
         if self._runner is None:
             raise BackendError("root backend without su runner cannot run shell commands")
-        return self._runner.run(f"su -c {shell_quote(command)}")
+        return self._runner.run(command)
 
     def _shell(self, command: str) -> str:
         if self._runner is None:
             raise BackendError("root backend without su runner cannot run shell commands")
-        code, out, err = self._runner.run(f"su -c {shell_quote(command)}")
+        code, out, err = self._runner.run(command)
         if code != 0:
             raise BackendError(f"su exit {code}: {err.strip() or out.strip()}")
         return out

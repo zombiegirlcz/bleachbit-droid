@@ -56,6 +56,14 @@ android {
         compose = true
     }
 
+    testOptions {
+        unitTests {
+            // ShellSession logs through android.util.Log, which is a stub in
+            // unit tests and throws unless stubs are allowed to return.
+            isReturnDefaultValues = true
+        }
+    }
+
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
