@@ -304,8 +304,10 @@ def test_list_sized_uses_a_real_tab_in_the_stat_format():
     """
     shell = FakeShell(
         {
+            # phase 1: resolve the fixed prefix, depth-bounded
+            "test -d": (0, "/sdcard/c\n", ""),
+            # phase 2: enumerate from it
             "find": (0, "4096\t/sdcard/c/a.bin\n2048\t/sdcard/c/sub/b.bin\n", ""),
-            "test -d": (0, "", ""),
         }
     )
     backend = AdbBackend(shell, "/data/user/0/x/files")
@@ -319,27 +321,52 @@ def test_list_sized_uses_a_real_tab_in_the_stat_format():
     assert "\\t" not in joined
 
 
-def test_list_sized_is_one_shell_call_for_the_whole_target():
-    """A target with N files must cost one command, not N."""
-    lines = "".join(f"10\t/sdcard/c/f{i}.bin\n" for i in range(500))
-    shell = FakeShell({"find": (0, lines, ""), "test -d": (0, "", "")})
+def test_list_sized_cost_does_not_grow_with_the_target():
+    """N files, and N matching directories, must still cost two commands.
+
+    `find` applies `-path` after walking, so `/data/data/*/code_cache/**` made
+    it descend through the complete data of all 407 installed apps and the scan
+    never finished (still running after 110 s). The fixed part of the pattern
+    is now resolved with exact depth bounds first, and every directory it finds
+    goes into one second `find` — two round trips, whatever N is.
+    """
+    dirs = "".join(f"/data/data/app{i}/code_cache\n" for i in range(407))
+    lines = "".join(f"10\t/data/data/app{i}/code_cache/f.dex\n" for i in range(407))
+    shell = FakeShell({"test -d": (0, dirs, ""), "find": (0, lines, "")})
     backend = AdbBackend(shell, "/data/user/0/x/files")
 
-    sized = backend.list_sized("/sdcard/c/**")
+    sized = backend.list_sized("/data/data/*/code_cache/**")
 
-    assert len(sized) == 500
+    assert len(sized) == 407
+    assert len(shell.calls) == 2
+    # the walk is bounded to the depth the prefix actually sits at
+    assert "-mindepth 2 -maxdepth 2" in shell.calls[0]
+    # and the second command starts from the directories, not from /data/data
+    assert "/data/data/app0/code_cache" in shell.calls[1]
+    assert "-path" not in shell.calls[1]
+
+
+def test_an_unbounded_pattern_still_costs_one_call():
+    """`**` in the middle has no fixed prefix to bound; one walk it is."""
+    lines = "".join(f"10\t/sdcard/one/f{i}.db\n" for i in range(50))
+    shell = FakeShell({"find": (0, lines, ""), "test -d": (0, lines, "")})
+    backend = AdbBackend(shell, "/data/user/0/x/files")
+
+    sized = backend.list_sized("/sdcard/**/*.db")
+
+    assert len(sized) == 50
     assert len(shell.calls) == 1
 
 
 def test_list_sized_skips_malformed_lines():
     shell = FakeShell(
         {
+            "test -d": (0, "/x\n", ""),
             "find": (
                 0,
                 "10\t/x/good\nnotanumber\t/x/bad\n\n20\t/x/also-good\n",
                 "",
             ),
-            "test -d": (0, "", ""),
         }
     )
     backend = AdbBackend(shell, "/data/user/0/x/files")
@@ -363,13 +390,19 @@ def test_single_star_does_not_cross_a_slash():
     globs with Python) never reported. ``find`` stays the prefilter; the
     backend now narrows its superset down.
     """
+    # phase 1: what a `-path` glob offers as prefix directories, `*` crossing
+    # `/` — only the first one is at the depth the pattern asks for
+    dirs = "/sdcard/Android/data/com.x/cache\n/sdcard/Android/data/com.x/files/cache\n"
+    # phase 2: files under whatever phase 1 kept
     offered = [
         "/sdcard/Android/data/com.x/cache/a",
         "/sdcard/Android/data/com.x/cache/deep/b",
         "/sdcard/Android/data/com.x/files/cache/c",
         "/sdcard/Android/data/com.x/files/lib/cache/d",
     ]
-    shell = FakeShell({"find": (0, _sized_lines(offered), ""), "test -d": (0, "", "")})
+    shell = FakeShell(
+        {"test -d": (0, dirs, ""), "find": (0, _sized_lines(offered), "")}
+    )
     backend = AdbBackend(shell, "/data/user/0/x/files")
 
     found = [path for path, _ in backend.list_sized("/sdcard/Android/data/*/cache/**")]
@@ -378,6 +411,8 @@ def test_single_star_does_not_cross_a_slash():
         "/sdcard/Android/data/com.x/cache/a",
         "/sdcard/Android/data/com.x/cache/deep/b",
     ]
+    # the wrong-depth directory never becomes a starting point
+    assert "/sdcard/Android/data/com.x/files/cache" not in shell.calls[1]
 
 
 def test_globstar_still_crosses_slashes():
@@ -424,10 +459,12 @@ def test_every_tier_reads_one_pattern_the_same_way(tmp_path):
     nonroot = NonRootBackend([str(tmp_path)], shared_storage=True)
     local = sorted(path for path, _ in nonroot.list_sized(pattern))
 
-    # What `find -path` (whose `*` crosses `/`) would hand back: everything.
+    # What `find` would hand back if its `*` crossed `/`: every candidate
+    # directory in phase 1, and every file under them in phase 2.
+    every_dir = "".join(f"{d}\n" for d in sorted(str(p) for p in tree.rglob("*") if p.is_dir()))
     everything = sorted(str(p) for p in tree.rglob("*") if p.is_file())
     shell = FakeShell(
-        {"find": (0, _sized_lines(everything), ""), "test -d": (0, "", "")}
+        {"test -d": (0, every_dir, ""), "find": (0, _sized_lines(everything), "")}
     )
     through_shell = sorted(path for path, _ in AdbBackend(shell, "/f").list_sized(pattern))
 

@@ -15,15 +15,29 @@ import org.json.JSONObject
  */
 class ProgressSink(
     private val onLine: (ProgressEvent) -> Unit,
+    private val audit: CleanAudit? = null,
 ) {
 
     @Suppress("unused") // called from Python via Chaquopy
     fun onEvent(json: String) {
+        // Written before parsing: a malformed event is exactly the kind of
+        // thing worth having on disk afterwards.
+        audit?.write(json)
         try {
             val o = JSONObject(json)
+            val type = o.optString("type", "?")
+            if (type == "failed" || type == "skip") {
+                // The panel shortens the path and scrolls away; a failure the
+                // user cannot quote is a failure nobody can fix.
+                Log.w(
+                    TAG,
+                    "$type cleaner=${o.optString("cleaner")} " +
+                        "path=${o.optString("path")} reason=${o.optString("reason")}",
+                )
+            }
             onLine(
                 ProgressEvent(
-                    type = o.optString("type", "?"),
+                    type = type,
                     cleaner = o.optString("cleaner", ""),
                     path = o.optString("path", ""),
                     bytes = o.optLong("bytes", 0L),

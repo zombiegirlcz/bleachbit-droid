@@ -343,6 +343,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                             }
                             if (summary.failed > 0) {
                                 append(", ${summary.failed} selhalo")
+                                // Point at the record instead of making the
+                                // user retype a reason the panel has scrolled
+                                // past. Only when something actually failed.
+                                summary.auditPath?.let { append("\nZáznam: $it") }
                             }
                         },
                     )

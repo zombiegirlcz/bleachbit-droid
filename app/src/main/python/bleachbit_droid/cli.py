@@ -208,10 +208,17 @@ def build_backend(args: argparse.Namespace):
         return NonRootBackend(allowed, vacuum_runner=vacuum, shared_storage=shared)
 
     if args.mode == "adb":
-        return AdbBackend(make_runner(args), roots["app_files"], vacuum_runner=vacuum)
+        return AdbBackend(
+            make_runner(args),
+            roots["app_files"],
+            vacuum_runner=vacuum,
+            own_package=args.own_package,
+        )
 
     if args.mode == "root":
-        return RootBackend(make_runner(args), vacuum_runner=vacuum)
+        return RootBackend(
+            make_runner(args), vacuum_runner=vacuum, own_package=args.own_package
+        )
 
     raise BackendError(f"unknown mode {args.mode!r}")
 
@@ -396,6 +403,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-shared-storage",
         action="store_true",
         help="non-root tier without the all-files grant (shared storage denied)",
+    )
+    common.add_argument(
+        "--own-package",
+        default=os.environ.get("BB_OWN_PACKAGE", "cz.zombie.bleachbitdroid"),
+        help="package to leave alone; clearing it force-stops the clean itself",
     )
     common.add_argument("--sdcard", default="/sdcard")
     common.add_argument("--android-data", default="/data/data")

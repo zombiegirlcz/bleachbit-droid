@@ -172,10 +172,11 @@ def _package_candidates(
     not compute it (permission missing), the cleaner is skipped rather than
     guessing.
     """
+    own = backend.own_package
     if spec.unused_days is not None:
-        return list(unused or [])
+        return [p for p in (unused or []) if p != own]
     try:
-        return backend.installed_packages()
+        return [p for p in backend.installed_packages() if p != own]
     except BackendError:
         return []
 

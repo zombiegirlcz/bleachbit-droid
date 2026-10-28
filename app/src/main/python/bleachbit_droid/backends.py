@@ -47,6 +47,13 @@ class PrivilegeBackend(ABC):
     #: package operations need a shell; path-only backends leave this False
     supports_packages: bool = False
 
+    #: The package the app itself runs as, so a package cleaner can leave it
+    #: alone. Clearing it means ``am force-stop`` on ourselves: the app dies
+    #: mid-clean, with no report and nothing written down. Measured on the
+    #: test device — `ActivityManager: Force stopping cz.zombie.bleachbitdroid
+    #: … from process:7806` roughly 50 s into a root clean, twice.
+    own_package: str = ""
+
     #: Whether ``pm clear --cache-only`` actually returns on this device.
     #: Only the ADB tier depends on it (the root tier deletes as the app's own
     #: uid, §6/3), so everything else may simply claim it works.
@@ -300,6 +307,36 @@ def _glob_to_regex(pattern: str) -> re.Pattern[str]:
     return re.compile("".join(parts) + r"\Z")
 
 
+def _bounded_prefix(pattern: str) -> tuple[str, str, int] | None:
+    """Split ``<fixed>/**`` into a depth-bounded ``find`` for ``<fixed>``.
+
+    Why: ``find`` applies ``-path`` *after* walking, so
+    ``/data/data/*/code_cache/**`` made it descend through the complete data of
+    all 407 installed apps to find 407 directories two levels down. The scan
+    never finished — it was still running after 110 s. The same shape bounded
+    to that depth answered immediately.
+
+    Returns ``(base, prefix_glob, depth)`` where every directory the prefix can
+    match sits at exactly ``depth`` levels below ``base``, or ``None`` when the
+    pattern has no fixed prefix to bound (``/sdcard/**/*.db``) and the walk is
+    genuinely unbounded.
+
+    The exact depth bounds also stop find's ``*`` from crossing ``/`` in the
+    prefix: a path at exactly ``depth`` levels has exactly ``depth`` segments,
+    so each ``*`` matched one of them.
+    """
+    if not pattern.endswith("/**"):
+        return None
+    prefix = pattern[: -len("/**")]
+    if "**" in prefix:
+        return None
+    base, _ = _find_base_and_glob(prefix)
+    relative = prefix[len(base):].strip("/")
+    if not relative:
+        return None
+    return base, prefix, len(relative.split("/"))
+
+
 def _pattern_matcher(pattern: str):
     """Predicate telling whether a path belongs to ``pattern``.
 
@@ -478,8 +515,50 @@ class _ShellMixin:
         except (IndexError, ValueError) as exc:
             raise BackendError(f"cannot parse stat output: {out!r}") from exc
 
+    def _sized_lines(self, pattern: str) -> tuple[int, str]:
+        """Run the ``find`` + ``stat`` that feeds :meth:`list_sized`.
+
+        One command for an unbounded pattern, two for a ``<fixed>/**`` one:
+        the first resolves the fixed part with exact depth bounds so ``find``
+        does not walk the whole subtree, the second enumerates from the
+        directories it found. Two round trips regardless of how many
+        directories match, because they all go into one ``find``.
+        """
+        bounded = _bounded_prefix(pattern)
+        if bounded is not None:
+            base, prefix, depth = bounded
+            code, out, _ = self._run_raw(
+                f"test -d {shell_quote(base)} && "
+                f"find {shell_quote(base)} -mindepth {depth} -maxdepth {depth} "
+                f"-path {shell_quote(prefix)}"
+            )
+            if code != 0:
+                return code, ""
+            keep_dir = _glob_to_regex(prefix)
+            roots = [
+                line for line in out.splitlines() if line.strip() and keep_dir.match(line)
+            ]
+            if not roots:
+                return 0, ""
+            args = " ".join(shell_quote(r) for r in roots)
+            return self._run_raw(
+                f"find {args} \\( -type f -o -type l \\) "
+                f"-exec stat -c '%s\t%n' {{}} +"
+            )[:2]
+
+        base, glob_pattern = _find_base_and_glob(pattern)
+        nested = glob_pattern.rstrip("/") + "/*"
+        code, out, _ = self._run_raw(
+            f"test -d {shell_quote(base)} && "
+            f"find {shell_quote(base)} "
+            f"\\( -path {shell_quote(glob_pattern)} -o -path {shell_quote(nested)} \\) "
+            f"\\( -type f -o -type l \\) "
+            f"-exec stat -c '%s\t%n' {{}} +"
+        )
+        return code, out
+
     def list_sized(self, pattern: str) -> list[tuple[str, int]]:
-        """One ``find`` + ``stat`` for the whole pattern.
+        """``find`` + ``stat`` for the whole pattern, in one or two commands.
 
         ``-path`` matches both files that match the glob and everything under a
         directory that matches it (find's ``*`` crosses ``/``), so a single
@@ -490,15 +569,7 @@ class _ShellMixin:
         ``_pattern_matcher`` then applies Python glob semantics so every tier
         reads one pattern the same way.
         """
-        base, glob_pattern = _find_base_and_glob(pattern)
-        nested = glob_pattern.rstrip("/") + "/*"
-        code, out, _ = self._run_raw(
-            f"test -d {shell_quote(base)} && "
-            f"find {shell_quote(base)} "
-            f"\\( -path {shell_quote(glob_pattern)} -o -path {shell_quote(nested)} \\) "
-            f"\\( -type f -o -type l \\) "
-            f"-exec stat -c '%s\t%n' {{}} +"
-        )
+        code, out = self._sized_lines(pattern)
         if code != 0:
             return []
         keep = _pattern_matcher(pattern)
@@ -570,6 +641,11 @@ class _ShellMixin:
 
     def clear_app_cache(self, package: str, force_stop: bool = True) -> Stats:
         pkg = _validate_package(package)
+        if self.own_package and pkg == self.own_package:
+            raise BackendError(
+                f"refusing to clear the cache of {pkg}: that is this app, and "
+                "force-stopping it would kill the clean halfway through"
+            )
         before = 0
         # uid 2000 cannot even traverse /data/data/<pkg> (verified on device:
         # `su 2000 -c du -sk /data/data/com.android.vending/cache` -> EACCES),
@@ -744,7 +820,14 @@ class AdbBackend(_SqliteMixin, _ShellMixin, PrivilegeBackend):
         {Capability.APP_DATA, Capability.SHARED_STORAGE, Capability.OTHER_APP_DATA}
     )
 
-    def __init__(self, runner, app_files_dir: str = "", vacuum_runner=None) -> None:
+    def __init__(
+        self,
+        runner,
+        app_files_dir: str = "",
+        vacuum_runner=None,
+        own_package: str = "",
+    ) -> None:
+        self.own_package = own_package
         self._runner = runner
         self._app_files_dir = os.path.realpath(app_files_dir) if app_files_dir else ""
         self._vacuum = vacuum_runner
@@ -826,7 +909,8 @@ class RootBackend(_SqliteMixin, _ShellMixin, PrivilegeBackend):
     name = "root"
     capabilities = frozenset(Capability)
 
-    def __init__(self, runner=None, vacuum_runner=None) -> None:
+    def __init__(self, runner=None, vacuum_runner=None, own_package: str = "") -> None:
+        self.own_package = own_package
         self._runner = runner
         self._vacuum = vacuum_runner
         if runner is None and os.geteuid() != 0:
@@ -899,6 +983,11 @@ class RootBackend(_SqliteMixin, _ShellMixin, PrivilegeBackend):
         safer thing here.
         """
         pkg = _validate_package(package)
+        if self.own_package and pkg == self.own_package:
+            raise BackendError(
+                f"refusing to clear the cache of {pkg}: that is this app, and "
+                "force-stopping it would kill the clean halfway through"
+            )
         uid = self.package_uid(pkg)
         if uid is None:
             # A package with no data directory simply has no cache to clear —

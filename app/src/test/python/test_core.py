@@ -521,6 +521,86 @@ def test_root_backend_clears_cache_as_the_apps_own_uid():
     assert not any("chown" in c for c in shell.calls), shell.calls
 
 
+# ---------------------------------------------------------------------------
+# the app must not clean itself to death
+# ---------------------------------------------------------------------------
+#
+# Measured on the test device, twice, roughly 50 s into a root clean:
+#
+#   ActivityManager: Force stopping cz.zombie.bleachbitdroid appid=10316
+#                    user=0: from process:7806
+#   ActivityManager: Killing 14604:cz.zombie.bleachbitdroid/u0a316 (adj 0)
+#
+# No exception, no signal — `clear_app_cache` ran `am force-stop` on every
+# package `pm list packages` returned, our own among them. The clean died
+# halfway through and took its report with it.
+
+def test_a_package_cleaner_skips_our_own_app(roots):
+    shell = FakeShell({
+        "pm list packages": (
+            0,
+            "package:com.a\npackage:cz.zombie.bleachbitdroid\npackage:com.b\n",
+            "",
+        ),
+        "stat": (0, "10316\n", ""),
+    })
+    backend = RootBackend(shell, own_package="cz.zombie.bleachbitdroid")
+
+    report = engine.scan(backend, roots, ["other_app_cache"])
+
+    offered = {e.package for e in report.entries}
+    assert offered == {"com.a", "com.b"}
+    assert "cz.zombie.bleachbitdroid" not in offered
+
+
+def test_the_unused_list_is_filtered_too(roots):
+    """Kotlin builds that list from UsageStats and we are in it as well."""
+    shell = FakeShell({"stat": (0, "10316\n", "")})
+    backend = RootBackend(shell, own_package="cz.zombie.bleachbitdroid")
+
+    report = engine.scan(
+        backend,
+        roots,
+        ["unused_app_cache"],
+        unused_packages=["com.a", "cz.zombie.bleachbitdroid"],
+    )
+
+    assert {e.package for e in report.entries} == {"com.a"}
+
+
+def test_applying_never_force_stops_our_own_app(roots):
+    shell = FakeShell({
+        "pm list packages": (
+            0,
+            "package:com.a\npackage:cz.zombie.bleachbitdroid\n",
+            "",
+        ),
+        "stat": (0, "10316\n", ""),
+    })
+    backend = RootBackend(shell, own_package="cz.zombie.bleachbitdroid")
+
+    engine.apply(backend, roots, ["other_app_cache"], dry_run=False)
+
+    assert not any("cz.zombie.bleachbitdroid" in c for c in shell.calls), shell.calls
+    assert any("com.a" in c for c in shell.calls), shell.calls
+
+
+@pytest.mark.parametrize("make", [
+    lambda shell: RootBackend(shell, own_package="cz.zombie.bleachbitdroid"),
+    lambda shell: AdbBackend(shell, "/app", own_package="cz.zombie.bleachbitdroid"),
+])
+def test_clearing_our_own_package_is_refused_outright(make):
+    """Defence behind the engine's filter: suicide must take two mistakes."""
+    shell = FakeShell({"stat": (0, "10316\n", ""), "command -v timeout": (1, "", "")})
+    backend = make(shell)
+
+    with pytest.raises(BackendError):
+        backend.clear_app_cache("cz.zombie.bleachbitdroid")
+
+    assert not any("force-stop" in c for c in shell.calls), shell.calls
+    assert not any("pm clear" in c for c in shell.calls), shell.calls
+
+
 def test_an_app_without_a_data_directory_is_not_a_failure():
     """Regression from a real clean on the test device.
 

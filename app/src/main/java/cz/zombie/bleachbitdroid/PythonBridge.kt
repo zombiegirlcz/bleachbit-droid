@@ -130,6 +130,9 @@ object PythonBridge {
 
     private fun basePayload(context: Context, mode: String): JSONObject = JSONObject().apply {
         put("mode", mode)
+        // Without this the package cleaners reach our own package and
+        // `am force-stop` kills the clean halfway through, with no report.
+        put("own_package", context.packageName)
         put("app_files", context.filesDir.absolutePath)
         put("app_cache", context.cacheDir.absolutePath)
         put("external", context.getExternalFilesDir(null)?.absolutePath ?: "")

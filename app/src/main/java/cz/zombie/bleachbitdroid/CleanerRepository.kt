@@ -47,6 +47,8 @@ data class CleanSummary(
     /** Cleared successfully, but the tier could not measure how much. */
     val unknown: Int,
     val logLines: List<String>,
+    /** Where the run was written down, so a failure can be quoted later. */
+    val auditPath: String? = null,
 )
 
 /** Parses the JSON documents coming out of the Python core. */
@@ -93,7 +95,10 @@ object CleanerRepository {
         unusedPackages: List<String>? = null,
         onProgress: ((ProgressEvent) -> Unit)? = null,
     ): ScanSummary = withContext(Dispatchers.Default) {
-        val sink = ProgressSink { onProgress?.invoke(it) }
+        val sink = ProgressSink(
+            { onProgress?.invoke(it) },
+            CleanAudit(context.filesDir, "scan-${mode.id}"),
+        )
         val json = PythonBridge.scanStreaming(
             context, mode.id, cleaners, unusedPackages, sink,
         )
@@ -123,7 +128,11 @@ object CleanerRepository {
         unusedPackages: List<String>? = null,
         onProgress: ((ProgressEvent) -> Unit)? = null,
     ): CleanSummary = withContext(Dispatchers.Default) {
-        val sink = ProgressSink { onProgress?.invoke(it) }
+        val audit = CleanAudit(
+            context.filesDir,
+            if (dryRun) "dryrun-${mode.id}" else "clean-${mode.id}",
+        )
+        val sink = ProgressSink({ onProgress?.invoke(it) }, audit)
         val json = PythonBridge.applyCleanStreaming(
             context, mode.id, cleaners, dryRun, unusedPackages, sink,
         )
@@ -132,7 +141,11 @@ object CleanerRepository {
         val lines = mutableListOf<String>()
         val log = json.getJSONArray("log")
         for (i in 0 until log.length()) {
-            lines += log.getJSONObject(i).toString()
+            val record = log.getJSONObject(i).toString()
+            lines += record
+            // The structured log carries the per-entry `reason`, which is the
+            // part that actually explains a failed run.
+            audit.write(record)
         }
 
         CleanSummary(
@@ -142,6 +155,7 @@ object CleanerRepository {
             failed = json.getInt("failed"),
             unknown = json.optInt("unknown", 0),
             logLines = lines,
+            auditPath = audit.path,
         )
     }
 

@@ -72,17 +72,22 @@ def _backend(data: dict[str, Any]):
     roots = _roots(data)
 
     vacuum = _vacuum_callable()
+    # Kotlin sends `context.packageName`; without it a package cleaner reaches
+    # our own package and `am force-stop` kills the clean halfway through.
+    own = str(data.get("own_package") or "")
 
     if mode == "root":
         runner = _ROOT_RUNNER
         if runner is None:
             raise BackendError("root backend requested but no su runner registered")
-        return RootBackend(runner, vacuum_runner=vacuum)
+        return RootBackend(runner, vacuum_runner=vacuum, own_package=own)
     if mode == "adb":
         runner = _ADB_RUNNER
         if runner is None:
             raise BackendError("adb backend requested but no runner registered")
-        return AdbBackend(runner, roots["app_files"], vacuum_runner=vacuum)
+        return AdbBackend(
+            runner, roots["app_files"], vacuum_runner=vacuum, own_package=own
+        )
     if mode == "nonroot":
         allowed = [p for p in (roots["app_files"], roots["app_cache"], roots["external"]) if p]
         # Shared storage is only reachable with MANAGE_EXTERNAL_STORAGE. The
