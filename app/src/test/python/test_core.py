@@ -87,6 +87,61 @@ class FakeShell:
 # cleaner metadata (AGENTS.md §8)
 # ---------------------------------------------------------------------------
 
+#: Directories that read like a cache and are not. A cleaner that globs one of
+#: these deletes live state, so the ban is a test, not a comment.
+#:
+#: `/data/resource-cache` holds *fabricated* runtime resource overlays next to
+#: its regenerable `@idmap` files. On the test device two were live —
+#: `cmd overlay list` showed `[x] com.android.systemui:accent` and
+#: `[x] com.android.systemui:neutral` backed by `*.frro` files there — and
+#: OverlayManager refers to them by path, so deleting one takes SystemUI's
+#: colour theme with it. The whole directory was 41 kB.
+#:
+#: `/data/app` holds the installed APKs and their `oat/*.odex`. Nothing there
+#: is disposable, however much a dalvik-cache entry named
+#: `data@app@~~hash==@pkg-hash==@base.apk@classes.dex` may look like it is.
+FORBIDDEN_ROOTS = ("/data/resource-cache", "/data/app", "/data/user", "/system")
+
+
+@pytest.mark.parametrize("spec", all_cleaners(), ids=lambda s: s.name)
+def test_cleaner_never_targets_live_state(spec):
+    for target in spec.paths:
+        for banned in FORBIDDEN_ROOTS:
+            assert not target.pattern.startswith(banned + "/"), (
+                f"{spec.name} targets {target.pattern}, which is not disposable"
+            )
+
+
+def test_an_empty_root_is_refused_instead_of_becoming_slash():
+    """`<app_cache>/**` with an empty root expands to `/**`.
+
+    `_find_base_and_glob` answers base `/` for that, so the scan would walk
+    the whole filesystem and the apply would delete every file it could
+    reach — APKs included. One `?: ""` on the Kotlin side is all it takes, so
+    the expansion refuses it rather than trusting the caller.
+    """
+    from bleachbit_droid.backends import _find_base_and_glob
+
+    # the hazard is real: `/**` really does collapse to the filesystem root
+    assert _find_base_and_glob("/**")[0] == "/"
+
+    used = {
+        token
+        for spec in all_cleaners()
+        for target in spec.paths
+        for token in re.findall(r"<([a-z_]+)>", target.pattern)
+    }
+    assert used, "no placeholders found — pattern syntax changed"
+
+    for token in sorted(used):
+        for bad in ("", "relative/path"):
+            with pytest.raises(BackendError):
+                engine.expand_pattern(f"<{token}>/**", {token: bad})
+
+    # and a sane root still expands
+    assert engine.expand_pattern("<sdcard>/x/**", {"sdcard": "/sdcard"}) == "/sdcard/x/**"
+
+
 @pytest.mark.parametrize("spec", all_cleaners(), ids=lambda s: s.name)
 def test_cleaner_metadata_complete(spec):
     assert spec.name and spec.description

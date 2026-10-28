@@ -174,14 +174,22 @@ CLEANERS: tuple[CleanerSpec, ...] = (
             Target("/data/misc/profiles/ref/**", Capability.SYSTEM),
         ),
     ),
+    # `/data/resource-cache` deliberately NOT included. It reads like a cache
+    # and it is not: alongside regenerable `@idmap` files it holds *fabricated*
+    # runtime resource overlays, and on the test device two of them were live —
+    # `cmd overlay list` reported `[x] com.android.systemui:accent` and
+    # `[x] com.android.systemui:neutral`, backed by
+    # `/data/resource-cache/com.android.systemui-{accent,neutral}-*.frro`.
+    # OverlayManager references those by path, so deleting one takes SystemUI's
+    # colour theme with it. The whole directory was 41 kB (2 kB of it the live
+    # overlays), which buys nothing against that risk.
     CleanerSpec(
         name="system_cache_dir",
-        description="Systémová /cache a resource-cache",
+        description="Systémová /cache",
         requires=(Capability.SYSTEM,),
         risk=Risk.MEDIUM,
         paths=(
             Target("/cache/**", Capability.SYSTEM),
-            Target("/data/resource-cache/**", Capability.SYSTEM),
         ),
     ),
     # /data/local/tmp is a shared scratch directory: 1.5 GB here, but other

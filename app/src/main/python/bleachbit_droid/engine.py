@@ -49,13 +49,27 @@ DELETE_FLUSH = 100
 # ---------------------------------------------------------------------------
 
 def expand(path: str, roots: dict[str, str]) -> str:
-    """Replace ``<name>`` tokens using ``roots``; unknown tokens are an error."""
+    """Replace ``<name>`` tokens using ``roots``.
+
+    An unknown token is an error, and so is an **empty or relative** one.
+    ``<app_cache>/**`` with an empty root expands to ``/**``, whose `find`
+    start directory is ``/`` — the scan would walk the whole filesystem and
+    the apply would delete every file it could reach, APKs included. Kotlin
+    fills these from ``context.cacheDir``/``filesDir`` so they are never
+    empty today, but one ``?: ""`` away from that is a wiped device, which is
+    too cheap a mistake to leave to the caller.
+    """
 
     def _sub(match: re.Match[str]) -> str:
         key = match.group(1)
         if key not in roots:
             raise KeyError(f"unknown path placeholder <{key}>")
-        return roots[key]
+        value = roots[key]
+        if not value or not value.startswith("/"):
+            raise BackendError(
+                f"path placeholder <{key}> is {value!r}; expected an absolute path"
+            )
+        return value
 
     return _PLACEHOLDER.sub(_sub, path)
 
