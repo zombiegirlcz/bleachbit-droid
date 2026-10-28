@@ -92,6 +92,8 @@ def select_cleaners(
             continue
         if spec.kind is Kind.PACKAGE and not backend.supports_packages:
             continue
+        if spec.kind is Kind.PACKAGE and not backend.supports_package_clear:
+            continue
         if spec.kind is Kind.SQLITE and not backend.can_vacuum(spec.requires):
             continue
         result.append(spec)
@@ -105,6 +107,7 @@ MISSING_LABELS: dict[str, str] = {
     "shell": "přístup k shellu",
     "sqlite3": "nástroj sqlite3",
     "sqlite3_as_owner": "sqlite3 nemůže běžet pod uid vlastníka databáze",
+    "package_clear": "pm clear na tomto zařízení neodpovídá",
 }
 
 
@@ -116,6 +119,10 @@ def describe(backend: PrivilegeBackend) -> list[dict]:
         if spec.kind is Kind.PACKAGE and not backend.supports_packages:
             if "shell" not in miss:
                 miss.append("shell")
+        elif spec.kind is Kind.PACKAGE and not backend.supports_package_clear:
+            # The tier has the privilege, the device just will not answer.
+            if "package_clear" not in miss:
+                miss.append("package_clear")
         if spec.kind is Kind.SQLITE and not backend.can_vacuum(spec.requires):
             # Two different reasons, and the user can only act on one of them:
             # a missing tool is a bug, a database we may not touch as its owner

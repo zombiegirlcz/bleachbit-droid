@@ -57,6 +57,13 @@ TIMEOUT_SEC = 120
 #:
 #: ``RootBackend`` itself sends plain commands and expects the runner to be
 #: root already — the Kotlin side keeps one persistent ``su`` shell open.
+#:
+#: Known ``nh-adb`` artefact: ``nh adb shell`` only returns once stdout reaches
+#: EOF, so a command whose child is SIGKILLed while an orphan still holds the
+#: pipe blocks until ``TIMEOUT_SEC`` even though the device-side command is long
+#: over. Measured with the ``pm clear --cache-only`` probe: 8 s on the device,
+#: 120 s through this bridge. The app does not share the problem — its
+#: ``ShellSession`` reads up to the ``__BB_END_<n>`` marker, never to EOF.
 RUNNER_SPECS: dict[str, tuple[list[str], bool]] = {
     "local": (["sh", "-c"], False),
     "nh-adb": (["nh", "adb", "shell"], False),

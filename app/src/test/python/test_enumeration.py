@@ -334,12 +334,111 @@ def test_list_sized_is_one_shell_call_for_the_whole_target():
 def test_list_sized_skips_malformed_lines():
     shell = FakeShell(
         {
-            "find": (0, "10\t/good\nnotanumber\t/bad\n\n20\t/also-good\n", ""),
+            "find": (
+                0,
+                "10\t/x/good\nnotanumber\t/x/bad\n\n20\t/x/also-good\n",
+                "",
+            ),
             "test -d": (0, "", ""),
         }
     )
     backend = AdbBackend(shell, "/data/user/0/x/files")
-    assert backend.list_sized("/x/**") == [("/good", 10), ("/also-good", 20)]
+    assert backend.list_sized("/x/**") == [("/x/good", 10), ("/x/also-good", 20)]
+
+
+# ---------------------------------------------------------------------------
+# glob semantics must not depend on the tier
+# ---------------------------------------------------------------------------
+
+def _sized_lines(paths: list[str]) -> str:
+    return "".join(f"10\t{path}\n" for path in paths)
+
+
+def test_single_star_does_not_cross_a_slash():
+    """Regression: ``find -path``'s ``*`` crosses ``/``, Python's does not.
+
+    On the test device ``/sdcard/Android/data/*/cache/**`` therefore also
+    matched ``/sdcard/Android/data/<pkg>/files/cache/...`` — 162 files and
+    25 MB that the pattern never asked for, and that the non-root tier (which
+    globs with Python) never reported. ``find`` stays the prefilter; the
+    backend now narrows its superset down.
+    """
+    offered = [
+        "/sdcard/Android/data/com.x/cache/a",
+        "/sdcard/Android/data/com.x/cache/deep/b",
+        "/sdcard/Android/data/com.x/files/cache/c",
+        "/sdcard/Android/data/com.x/files/lib/cache/d",
+    ]
+    shell = FakeShell({"find": (0, _sized_lines(offered), ""), "test -d": (0, "", "")})
+    backend = AdbBackend(shell, "/data/user/0/x/files")
+
+    found = [path for path, _ in backend.list_sized("/sdcard/Android/data/*/cache/**")]
+
+    assert found == [
+        "/sdcard/Android/data/com.x/cache/a",
+        "/sdcard/Android/data/com.x/cache/deep/b",
+    ]
+
+
+def test_globstar_still_crosses_slashes():
+    """``**`` is the one wildcard that may span directories."""
+    offered = [
+        "/sdcard/a.db",
+        "/sdcard/one/b.db",
+        "/sdcard/one/two/three/c.db",
+        "/sdcard/one/two/d.txt",
+    ]
+    shell = FakeShell({"find": (0, _sized_lines(offered), ""), "test -d": (0, "", "")})
+    backend = AdbBackend(shell, "/data/user/0/x/files")
+
+    found = [path for path, _ in backend.list_sized("/sdcard/**/*.db")]
+
+    assert found == [
+        "/sdcard/a.db",
+        "/sdcard/one/b.db",
+        "/sdcard/one/two/three/c.db",
+    ]
+
+
+def test_every_tier_reads_one_pattern_the_same_way(tmp_path):
+    """The non-root and shell tiers must agree about what a pattern means.
+
+    They use different engines — Python ``glob`` locally, ``find`` over the
+    shell — so this feeds the shell tier exactly what a real ``find`` would
+    return for the same tree and compares the two answers.
+    """
+    tree = tmp_path / "Android" / "data"
+    for relative in (
+        "com.x/cache/a",
+        "com.x/cache/deep/b",
+        "com.x/files/cache/c",
+        "com.y/cache/d",
+        "com.y/files/other/e",
+    ):
+        target = tree / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"0123456789")
+
+    pattern = f"{tmp_path}/Android/data/*/cache/**"
+
+    nonroot = NonRootBackend([str(tmp_path)], shared_storage=True)
+    local = sorted(path for path, _ in nonroot.list_sized(pattern))
+
+    # What `find -path` (whose `*` crosses `/`) would hand back: everything.
+    everything = sorted(str(p) for p in tree.rglob("*") if p.is_file())
+    shell = FakeShell(
+        {"find": (0, _sized_lines(everything), ""), "test -d": (0, "", "")}
+    )
+    through_shell = sorted(path for path, _ in AdbBackend(shell, "/f").list_sized(pattern))
+
+    assert local == through_shell
+    assert local == sorted(
+        [
+            str(tree / "com.x/cache/a"),
+            str(tree / "com.x/cache/deep/b"),
+            str(tree / "com.y/cache/d"),
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------

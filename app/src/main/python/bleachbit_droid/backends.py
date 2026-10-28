@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import shutil
 import stat
 from abc import ABC, abstractmethod
@@ -45,6 +46,11 @@ class PrivilegeBackend(ABC):
     capabilities: frozenset[Capability] = frozenset()
     #: package operations need a shell; path-only backends leave this False
     supports_packages: bool = False
+
+    #: Whether ``pm clear --cache-only`` actually returns on this device.
+    #: Only the ADB tier depends on it (the root tier deletes as the app's own
+    #: uid, §6/3), so everything else may simply claim it works.
+    supports_package_clear: bool = True
     #: database operations need the bundled glibc sqlite3; overridden as a
     #: property by _SqliteMixin
     supports_sqlite: bool = False
@@ -77,6 +83,7 @@ class PrivilegeBackend(ABC):
             "name": self.name,
             "capabilities": sorted(c.value for c in self.capabilities),
             "supports_packages": self.supports_packages,
+            "supports_package_clear": self.supports_package_clear,
             "supports_sqlite": self.supports_sqlite,
         }
 
@@ -250,12 +257,78 @@ def _iter_leaves(path: str) -> list[str]:
     return leaves
 
 
+def _segment_to_regex(segment: str) -> str:
+    """Translate one path segment of a glob into a regex that cannot cross ``/``."""
+    out: list[str] = []
+    index = 0
+    while index < len(segment):
+        char = segment[index]
+        if char == "*":
+            out.append("[^/]*")
+        elif char == "?":
+            out.append("[^/]")
+        elif char == "[":
+            end = segment.find("]", index + 1)
+            if end < 0:
+                out.append(re.escape(char))
+            else:
+                body = segment[index + 1 : end]
+                if body.startswith("!"):
+                    body = "^" + body[1:]
+                out.append(f"[{body}]")
+                index = end + 1
+                continue
+        else:
+            out.append(re.escape(char))
+        index += 1
+    return "".join(out)
+
+
+def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Compile a glob with *Python* semantics: ``**`` crosses ``/``, ``*`` does not."""
+    segments = pattern.split("/")
+    parts: list[str] = []
+    for index, segment in enumerate(segments):
+        if index and segments[index - 1] != "**":
+            parts.append("/")
+        if segment == "**":
+            # ``**`` spans any number of segments, including none; when it is
+            # not the last one it consumes its own trailing separator.
+            parts.append(".*" if index == len(segments) - 1 else "(?:[^/]+/)*")
+        else:
+            parts.append(_segment_to_regex(segment))
+    return re.compile("".join(parts) + r"\Z")
+
+
+def _pattern_matcher(pattern: str):
+    """Predicate telling whether a path belongs to ``pattern``.
+
+    Why this exists: ``find -path`` is the only glob the device offers and its
+    ``*`` crosses ``/``, so ``/sdcard/Android/data/*/cache/**`` also matched
+    ``/sdcard/Android/data/<pkg>/files/cache/...`` — 162 extra files and 25 MB
+    on the test device. Worse, the non-root tier globs with Python, where ``*``
+    stops at ``/``, so one pattern meant two different things depending on the
+    tier. The shell ``-path`` glob is always a *superset* of the correct match
+    (crossing only widens it), so it stays as a cheap device-side prefilter and
+    the exact decision is made here.
+    """
+    direct = _glob_to_regex(pattern)
+    # A directory that matches the pattern contributes everything below it.
+    nested = _glob_to_regex(pattern.rstrip("/") + "/**")
+
+    def matches(path: str) -> bool:
+        return bool(direct.match(path) or nested.match(path))
+
+    return matches
+
+
 def _find_base_and_glob(pattern: str) -> tuple[str, str]:
     """Split a glob pattern into a `find` start dir and a `-path` glob.
 
     ``find``'s ``*`` already crosses ``/``, so ``**`` is folded to ``*``; that
     keeps recursive patterns working on Android's toybox ``find``, which has no
-    ``globstar``.
+    ``globstar``. The result is deliberately a superset — ``_pattern_matcher``
+    narrows it back down to Python glob semantics.
     """
     first_wild = min(
         (i for i in (pattern.find("*"), pattern.find("?"), pattern.find("[")) if i >= 0),
@@ -303,6 +376,49 @@ class _ShellMixin:
 
     supports_packages = True
 
+    #: A package name that cannot be installed, so probing with it never
+    #: clears anybody's cache. Must pass ``_validate_package``.
+    PROBE_PACKAGE = "bb.probe.absent"
+
+    #: Seconds a single ``pm clear`` may take before we call it hung.
+    CLEAR_TIMEOUT_SEC = 8
+
+    def _clear_prefix(self) -> str:
+        """``timeout`` prefix for ``pm clear``, empty when the device has none."""
+        if getattr(self, "_timeout_prefix", None) is None:
+            code, _, _ = self._run_raw("command -v timeout")
+            self._timeout_prefix = (
+                f"timeout -s KILL {self.CLEAR_TIMEOUT_SEC} " if code == 0 else ""
+            )
+        return self._timeout_prefix
+
+    def _probe_package_clear(self) -> bool:
+        """Does ``pm clear --cache-only`` come back at all?
+
+        On the test device (HyperOS, SDK 33) it does not: as uid 2000 the call
+        blocks forever — even for a package that does not exist — while the
+        same command as root answers instantly. Each attempt left another
+        stuck process behind. Shizuku runs as that same uid 2000, so the app's
+        ADB tier is affected identically, and the two package cleaners are the
+        only thing that tier has for other apps' caches.
+
+        Probed with a package that cannot exist: on a healthy device that
+        returns immediately, here it hangs, and either way no cache is touched.
+        """
+        prefix = self._clear_prefix()
+        if not prefix:
+            # No ``timeout`` to bound the probe with, so a probe could itself
+            # hang forever. Keep the advertised behaviour instead of guessing.
+            return True
+        code, _, _ = self._run_raw(
+            f"{prefix}cmd package clear --cache-only {self.PROBE_PACKAGE}"
+        )
+        # 124 = toybox timeout gave up, 137 = the SIGKILL it then sent. A
+        # negative code is the runner itself giving up (both `ShellSession`
+        # and the CLI report a timeout as -1), which means the same thing:
+        # the clear never came back.
+        return code >= 0 and code not in (124, 137)
+
     def _shell(self, command: str) -> str:  # pragma: no cover - overridden
         raise NotImplementedError
 
@@ -329,7 +445,10 @@ class _ShellMixin:
         )
         if code != 0:
             return []
-        return sorted(line for line in out.splitlines() if line.strip())
+        keep = _glob_to_regex(pattern)
+        return sorted(
+            line for line in out.splitlines() if line.strip() and keep.match(line)
+        )
 
     def leaves(self, path: str) -> list[str]:
         """Deletable entries under ``path`` as the shell sees them."""
@@ -366,6 +485,10 @@ class _ShellMixin:
         directory that matches it (find's ``*`` crosses ``/``), so a single
         command covers the whole cleaner target. ``-exec ... +`` batches the
         stats instead of spawning one process per file.
+
+        Because find's ``*`` crosses ``/``, what comes back is a superset;
+        ``_pattern_matcher`` then applies Python glob semantics so every tier
+        reads one pattern the same way.
         """
         base, glob_pattern = _find_base_and_glob(pattern)
         nested = glob_pattern.rstrip("/") + "/*"
@@ -378,6 +501,7 @@ class _ShellMixin:
         )
         if code != 0:
             return []
+        keep = _pattern_matcher(pattern)
         result: list[tuple[str, int]] = []
         seen: set[str] = set()
         for line in out.splitlines():
@@ -388,7 +512,7 @@ class _ShellMixin:
                 size = int(size_text)
             except ValueError:
                 continue
-            if path in seen:
+            if path in seen or not keep(path):
                 continue
             seen.add(path)
             result.append((path, size))
@@ -466,7 +590,12 @@ class _ShellMixin:
             except BackendError:
                 pass
 
-        self._shell(f"pm clear --cache-only {pkg}")
+        # Bounded on purpose: on the test device (HyperOS, uid 2000) this call
+        # never returns at all, so an unbounded clear would hang the tier for
+        # the runner's full timeout *per package* — 411 installed packages at
+        # 120 s each is 13 hours of doing nothing. A hang now surfaces as a
+        # failure for that one package.
+        self._shell(f"{self._clear_prefix()}pm clear --cache-only {pkg}")
         return Stats(files=0, bytes=before, size_known=known)
 
     def installed_packages(self) -> list[str]:
@@ -619,6 +748,15 @@ class AdbBackend(_SqliteMixin, _ShellMixin, PrivilegeBackend):
         self._runner = runner
         self._app_files_dir = os.path.realpath(app_files_dir) if app_files_dir else ""
         self._vacuum = vacuum_runner
+        self._timeout_prefix: str | None = None
+        self._package_clear: bool | None = None
+
+    @property
+    def supports_package_clear(self) -> bool:
+        """Probed once per backend instance; see ``_probe_package_clear``."""
+        if self._package_clear is None:
+            self._package_clear = self._probe_package_clear()
+        return self._package_clear
 
     def _vacuum_runner(self):
         if self._vacuum is None:
@@ -763,7 +901,12 @@ class RootBackend(_SqliteMixin, _ShellMixin, PrivilegeBackend):
         pkg = _validate_package(package)
         uid = self.package_uid(pkg)
         if uid is None:
-            raise BackendError(f"no data directory for {pkg}")
+            # A package with no data directory simply has no cache to clear —
+            # that is not a failure. `other_app_cache` walks every installed
+            # package (411 on the test device), most of them system stubs, so
+            # raising here flooded the report with failures that read like
+            # something had gone wrong.
+            return Stats(files=0, bytes=0)
 
         cache = f"/data/data/{pkg}/cache"
         before = 0
@@ -783,9 +926,18 @@ class RootBackend(_SqliteMixin, _ShellMixin, PrivilegeBackend):
         # -mindepth 1 keeps the cache directory itself; -delete removes files
         # and empty directories bottom-up. Running through `su <uid>` is the
         # whole point: the filesystem sees the app's own uid, not root's.
-        code, out, err = self._runner.run(
-            f"su {uid} -c {shell_quote(f'find {cache} -mindepth 1 -delete 2>&1')}"
-        )
+        #
+        # The `[ -d ]` test is part of the same command on purpose. Most apps
+        # never create a `cache` directory at all, and `find` on a missing one
+        # prints "No such file or directory" and exits non-zero — which the
+        # engine recorded as a failed cleaner entry. A real clean therefore
+        # reported hundreds of apps as broken halfway through. Nothing to
+        # clear is success, and testing inside the command keeps it at one
+        # round trip per package instead of two.
+        #
+        # `if`, not `exit 0`: a bare `exit` would end the shell that runs it.
+        script = f"if [ -d {cache} ]; then find {cache} -mindepth 1 -delete 2>&1; fi"
+        code, out, err = self._runner.run(f"su {uid} -c {shell_quote(script)}")
         if code != 0:
             raise BackendError(
                 f"cannot clear cache of {pkg} as uid {uid}: {err.strip() or out.strip()}"

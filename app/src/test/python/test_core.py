@@ -11,6 +11,7 @@ All deletion tests use throwaway fixture trees, never real system data
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -68,10 +69,16 @@ class FakeShell:
         self.calls: list[str] = []
         self.replies = replies or {}
 
+    #: ``pm clear`` goes out behind a ``timeout -s KILL N`` guard on every
+    #: device that has ``timeout`` (a hung clear must not eat the whole run),
+    #: but a test names the command it cares about, not the guard.
+    _GUARD = re.compile(r"^timeout (?:-s \w+ )?\d+ ")
+
     def run(self, command: str) -> tuple[int, str, str]:
         self.calls.append(command)
+        key = self._GUARD.sub("", command)
         for prefix, reply in self.replies.items():
-            if command.startswith(prefix):
+            if key.startswith(prefix):
                 return reply
         return 0, "", ""
 
@@ -248,7 +255,7 @@ def test_adb_clear_app_cache_runs_pm_and_force_stop():
 
     assert stats.bytes == 16 * 1024
     assert any(c == "am force-stop com.example" for c in shell.calls)
-    assert any(c == "pm clear --cache-only com.example" for c in shell.calls)
+    assert any(c.endswith("pm clear --cache-only com.example") for c in shell.calls)
 
 
 def test_adb_clear_app_cache_can_skip_force_stop():
@@ -262,7 +269,7 @@ def test_adb_clear_app_cache_survives_force_stop_failure():
     shell = FakeShell({"am force-stop": (1, "", "nope")})
     backend = AdbBackend(shell, "/app")
     backend.clear_app_cache("com.example", force_stop=True)
-    assert any(c.startswith("pm clear") for c in shell.calls)
+    assert any("pm clear" in c for c in shell.calls)
 
 
 def test_adb_clear_app_cache_propagates_pm_failure():
@@ -270,6 +277,141 @@ def test_adb_clear_app_cache_propagates_pm_failure():
     backend = AdbBackend(shell, "/app")
     with pytest.raises(BackendError):
         backend.clear_app_cache("com.example")
+
+
+# ---------------------------------------------------------------------------
+# a device where `pm clear --cache-only` never returns
+# ---------------------------------------------------------------------------
+#
+# Measured on the test device (HyperOS, SDK 33) through Shizuku's own uid:
+#
+#   uid 2000: `cmd package clear --cache-only <anything>` never returns — not
+#             even for a package that does not exist; each attempt left a stuck
+#             process behind (seven of them accumulated while testing).
+#   uid 0   : the same command answers "Success" instantly.
+#
+# Those two cleaners are the only thing the ADB tier has for other apps'
+# caches, so the tier must say so instead of hanging 411 times.
+
+def _hanging_shell() -> FakeShell:
+    """A device whose ``pm clear`` only ever ends by being killed."""
+    return FakeShell({
+        "command -v timeout": (0, "/system/bin/timeout\n", ""),
+        "cmd package clear": (137, "", ""),
+        "pm clear": (137, "", ""),
+    })
+
+
+def test_pm_clear_that_hangs_disables_the_package_cleaners():
+    backend = AdbBackend(_hanging_shell(), "/app")
+
+    assert backend.supports_packages is True
+    assert backend.supports_package_clear is False
+
+    chosen = [spec.name for spec in engine.select_cleaners(backend)]
+    assert "other_app_cache" not in chosen
+    assert "unused_app_cache" not in chosen
+    # the tier keeps everything that does not depend on the package manager
+    assert "external_app_cache" in chosen
+
+
+def test_hanging_pm_clear_is_explained_in_czech():
+    items = {i["name"]: i for i in engine.describe(AdbBackend(_hanging_shell(), "/app"))}
+
+    item = items["other_app_cache"]
+    assert item["enabled"] is False
+    assert "package_clear" in item["missing"]
+    assert item["missing_labels"] == ["pm clear na tomto zařízení neodpovídá"]
+    # "shell" would be a lie: the tier has a shell, the device just won't answer
+    assert "shell" not in item["missing"]
+
+
+def test_a_runner_level_timeout_also_counts_as_hanging():
+    """Both ``ShellSession`` and the CLI report their own timeout as ``-1``.
+
+    If the device-side ``timeout`` guard never gets to fire — the bridge gives
+    up first — the conclusion must still be that the clear does not return.
+    """
+    shell = FakeShell({
+        "command -v timeout": (0, "/system/bin/timeout\n", ""),
+        "cmd package clear": (-1, "", "timeout after 120s"),
+    })
+    backend = AdbBackend(shell, "/app")
+
+    assert backend.supports_package_clear is False
+
+
+def test_package_cleaners_survive_a_device_that_answers():
+    shell = FakeShell({"command -v timeout": (0, "/system/bin/timeout\n", "")})
+    backend = AdbBackend(shell, "/app")
+
+    assert backend.supports_package_clear is True
+    assert "other_app_cache" in [s.name for s in engine.select_cleaners(backend)]
+
+
+def test_the_probe_clears_nobody():
+    """The probe must name a package that cannot exist."""
+    shell = FakeShell({"command -v timeout": (0, "/system/bin/timeout\n", "")})
+    backend = AdbBackend(shell, "/app")
+    assert backend.supports_package_clear is True
+
+    probes = [c for c in shell.calls if "package clear" in c]
+    assert len(probes) == 1
+    assert backend.PROBE_PACKAGE in probes[0]
+    # a real package name must never appear, and the probe name must be one
+    # the package validator accepts
+    assert _validate_package(backend.PROBE_PACKAGE) == backend.PROBE_PACKAGE
+
+
+def test_the_probe_runs_once_per_backend():
+    """Describe + select must not re-probe; a hung probe costs 8 s each time."""
+    shell = FakeShell({"command -v timeout": (0, "/system/bin/timeout\n", "")})
+    backend = AdbBackend(shell, "/app")
+
+    engine.describe(backend)
+    engine.select_cleaners(backend)
+    engine.describe(backend)
+
+    assert len([c for c in shell.calls if "package clear" in c]) == 1
+
+
+def test_a_real_clear_is_bounded_by_a_timeout():
+    """One hung package must not eat the runner's whole timeout budget."""
+    shell = FakeShell({"command -v timeout": (0, "/system/bin/timeout\n", "")})
+    backend = AdbBackend(shell, "/app")
+
+    backend.clear_app_cache("com.example", force_stop=False)
+
+    clears = [c for c in shell.calls if "pm clear" in c]
+    assert clears == [
+        f"timeout -s KILL {backend.CLEAR_TIMEOUT_SEC} pm clear --cache-only com.example"
+    ]
+
+
+def test_a_device_without_timeout_is_taken_at_its_word():
+    """Without ``timeout`` the probe cannot be bounded, so it is not run.
+
+    Disabling the cleaners on a guess would be worse than the hang: the probe
+    itself would be the thing that hangs forever.
+    """
+    shell = FakeShell({"command -v timeout": (1, "", "not found")})
+    backend = AdbBackend(shell, "/app")
+
+    assert backend.supports_package_clear is True
+    assert not any("package clear" in c for c in shell.calls)
+
+    backend.clear_app_cache("com.example", force_stop=False)
+    assert any(c == "pm clear --cache-only com.example" for c in shell.calls)
+
+
+def test_root_tier_is_unaffected_by_the_probe():
+    """The root tier never calls ``pm clear`` at all (AGENTS.md §6/3)."""
+    shell = FakeShell({"stat": (0, "10316\n", ""), "du": (0, "10\t/x\n", "")})
+    backend = RootBackend(shell)
+
+    assert backend.supports_package_clear is True
+    assert "other_app_cache" in [s.name for s in engine.select_cleaners(backend)]
+    assert not any("package clear" in c for c in shell.calls)
 
 
 def test_adb_installed_packages_parses_pm_output():
@@ -324,12 +466,57 @@ def test_root_backend_clears_cache_as_the_apps_own_uid():
     assert not any("chown" in c for c in shell.calls), shell.calls
 
 
-def test_root_backend_refuses_app_without_data_directory():
+def test_an_app_without_a_data_directory_is_not_a_failure():
+    """Regression from a real clean on the test device.
+
+    `other_app_cache` walks every installed package — 411 of them, most
+    system stubs with no data directory at all. Raising for those turned the
+    second half of the run into a wall of failures that read as if the cleaner
+    had broken the apps it named.
+    """
     shell = FakeShell({"stat": (1, "", "No such file or directory")})
     backend = RootBackend(shell)
-    with pytest.raises(BackendError):
-        backend.clear_app_cache("com.gone")
+
+    stats = backend.clear_app_cache("com.gone")
+
+    assert stats.bytes == 0
+    assert stats.files == 0
+    # nothing to clear means nothing is touched
     assert not any("find" in c for c in shell.calls), shell.calls
+
+
+def test_an_app_without_a_cache_directory_is_not_a_failure():
+    """The same wall of failures, one step later.
+
+    Most apps never create `cache` at all, and toybox `find` on a missing
+    directory prints "No such file or directory" and exits non-zero. The test
+    device answered exactly that for app after app.
+    """
+    shell = FakeShell({"stat": (0, "10316\n", "")})
+    backend = RootBackend(shell)
+
+    stats = backend.clear_app_cache("com.example", force_stop=False)
+
+    assert stats.files == 0
+    # the existence test travels inside the one command, as the app's own uid
+    deletes = [c for c in shell.calls if "-delete" in c]
+    assert len(deletes) == 1
+    assert deletes[0].startswith("su 10316 -c")
+    assert "[ -d /data/data/com.example/cache ]" in deletes[0]
+    # `exit` inside the command would kill the shell that runs it
+    assert "exit 0" not in deletes[0]
+
+
+def test_a_real_clear_failure_is_still_reported():
+    """Only *absence* is benign; a refused delete must still fail loudly."""
+    shell = FakeShell({
+        "stat": (0, "10316\n", ""),
+        "su 10316 -c": (1, "", "Permission denied"),
+    })
+    backend = RootBackend(shell)
+
+    with pytest.raises(BackendError):
+        backend.clear_app_cache("com.example", force_stop=False)
 
 
 def test_root_backend_requires_runner_when_not_root():
@@ -434,7 +621,7 @@ def test_apply_package_cleaner_clears_through_backend(roots):
 
     assert report.failed == 0
     assert report.freed_bytes == 32 * 1024
-    assert any(c == "pm clear --cache-only com.b" for c in shell.calls)
+    assert any(c.endswith("pm clear --cache-only com.b") for c in shell.calls)
     assert any("com.a" not in c for c in shell.calls)
 
 
@@ -445,7 +632,12 @@ def test_apply_package_cleaner_dry_run_touches_nothing(roots):
         backend, roots, ["unused_app_cache"], dry_run=True, unused_packages=["com.b"]
     )
     assert report.dry_run
-    assert shell.calls == []
+    # The tier is probed (read-only) to learn whether `pm clear` answers at
+    # all, but nothing on the device may change.
+    assert not any(
+        "pm clear" in c or "am force-stop" in c or c.startswith("rm ")
+        for c in shell.calls
+    ), shell.calls
 
 
 def test_apply_package_cleaner_counts_failures(roots):
