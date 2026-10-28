@@ -17,8 +17,10 @@ import java.util.Locale
  * not quote is a failure nobody can fix.
  *
  * `filesDir/logs` is deliberately outside `cacheDir`: the `app_cache` cleaner
- * globs `<app_cache>/**` and `<app_files>/cache/**`, so a log kept there would
- * be deleted by the very run it is recording.
+ * globs the whole cache directory and `files/cache` recursively, so a log kept
+ * there would be deleted by the very run it is recording. (The glob patterns
+ * are not spelled out here on purpose -- a slash-star inside a KDoc block
+ * opens a nested Kotlin comment and broke the build once already.)
  */
 class CleanAudit(filesDir: File, mode: String) {
 
