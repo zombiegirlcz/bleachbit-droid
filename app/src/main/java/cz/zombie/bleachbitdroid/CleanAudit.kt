@@ -36,12 +36,29 @@ class CleanAudit(filesDir: File, mode: String) {
 
     val path: String? get() = file?.absolutePath
 
+    private val lock = Any()
+
+    /**
+     * Append one event.
+     *
+     * Synchronized because the log is evidence, and evidence that can be
+     * spliced is worthless. One line in the 02:54 clean log read
+     * as a `found` event for cleaner `logcat_dumps` whose path broke off at
+     * `/da`, followed by the tail of a completely different event -- two
+     * writers landing in one line, which also hid the breakage from a JSON
+     * parser, since a duplicated key still parses. Whatever produced the
+     * second writer, the log itself must not be the thing that loses the
+     * proof. (No brace is quoted here on purpose: a stray one in a comment
+     * makes every brace-balance check read this file as broken.)
+     */
     fun write(json: String) {
         val target = file ?: return
-        try {
-            target.appendBytes((json + "\n").toByteArray())
-        } catch (t: Throwable) {
-            Log.w(TAG, "cannot append to audit log", t)
+        synchronized(lock) {
+            try {
+                target.appendBytes((json + "\n").toByteArray())
+            } catch (t: Throwable) {
+                Log.w(TAG, "cannot append to audit log", t)
+            }
         }
     }
 

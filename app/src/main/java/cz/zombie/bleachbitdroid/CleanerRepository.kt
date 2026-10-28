@@ -2,6 +2,8 @@ package cz.zombie.bleachbitdroid
 
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -54,39 +56,58 @@ data class CleanSummary(
 /** Parses the JSON documents coming out of the Python core. */
 object CleanerRepository {
 
+    /**
+     * One run at a time, across the whole process.
+     *
+     * Why: nothing used to stop a second tap. `scan()` and `clean()` each
+     * launch their own coroutine on [Dispatchers.Default], a *pool*, so two
+     * runs really did execute side by side -- the audit logs show three root
+     * runs started within 36 seconds, which is far less than one root scan
+     * takes. Both then drove the same module-level Python backend and the same
+     * persistent shell, whose marker protocol assumes one command in flight at
+     * a time. The visible damage was spliced output: a progress line reading
+     * `/davendor.qti.iwlan/cache`, a path with seven characters missing from
+     * the middle, which on apply can only ever come back as "no such file or
+     * directory". None of the three runs ever reached the apply phase.
+     *
+     * The ViewModel also refuses taps while a run is in flight, but that guard
+     * is advisory -- this one is the serialization point.
+     */
+    private val runLock = Mutex()
+
     suspend fun cleaners(
         context: Context,
         mode: PrivilegeMode,
-    ): Pair<BackendInfo, List<CleanerItem>> = withContext(Dispatchers.Default) {
-        val json = PythonBridge.listCleaners(context, mode.id)
-        json.optString("error").takeIf { it.isNotEmpty() }?.let { error(it) }
+    ): Pair<BackendInfo, List<CleanerItem>> = withContext(Dispatchers.Default) { runLock.withLock {
+            val json = PythonBridge.listCleaners(context, mode.id)
+            json.optString("error").takeIf { it.isNotEmpty() }?.let { error(it) }
 
-        val backend = json.getJSONObject("backend")
-        val info = BackendInfo(
-            name = backend.getString("name"),
-            capabilities = backend.getJSONArray("capabilities").toStringList(),
-            supportsPackages = backend.optBoolean("supports_packages", false),
-        )
-
-        val cleaners = mutableListOf<CleanerItem>()
-        val arr = json.getJSONArray("cleaners")
-        for (i in 0 until arr.length()) {
-            val o = arr.getJSONObject(i)
-            cleaners += CleanerItem(
-                name = o.getString("name"),
-                description = o.getString("description"),
-                risk = o.getString("risk"),
-                requires = o.getJSONArray("requires").toStringList(),
-                enabled = o.getBoolean("enabled"),
-                missing = o.getJSONArray("missing").toStringList(),
-                missingLabels = o.optJSONArray("missing_labels")?.toStringList()
-                    ?: o.getJSONArray("missing").toStringList(),
-                kind = o.optString("kind", "path"),
-                unusedDays = o.optInt("unused_days", 0),
+            val backend = json.getJSONObject("backend")
+            val info = BackendInfo(
+                name = backend.getString("name"),
+                capabilities = backend.getJSONArray("capabilities").toStringList(),
+                supportsPackages = backend.optBoolean("supports_packages", false),
             )
-        }
-        info to cleaners
-    }
+
+            val cleaners = mutableListOf<CleanerItem>()
+            val arr = json.getJSONArray("cleaners")
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                cleaners += CleanerItem(
+                    name = o.getString("name"),
+                    description = o.getString("description"),
+                    risk = o.getString("risk"),
+                    requires = o.getJSONArray("requires").toStringList(),
+                    enabled = o.getBoolean("enabled"),
+                    missing = o.getJSONArray("missing").toStringList(),
+                    missingLabels = o.optJSONArray("missing_labels")?.toStringList()
+                        ?: o.getJSONArray("missing").toStringList(),
+                    kind = o.optString("kind", "path"),
+                    unusedDays = o.optInt("unused_days", 0),
+                )
+            }
+            info to cleaners
+    }}
 
     suspend fun scan(
         context: Context,
@@ -94,31 +115,31 @@ object CleanerRepository {
         cleaners: List<String>,
         unusedPackages: List<String>? = null,
         onProgress: ((ProgressEvent) -> Unit)? = null,
-    ): ScanSummary = withContext(Dispatchers.Default) {
-        val sink = ProgressSink(
-            { onProgress?.invoke(it) },
-            CleanAudit(context.filesDir, "scan-${mode.id}"),
-        )
-        val json = PythonBridge.scanStreaming(
-            context, mode.id, cleaners, unusedPackages, sink,
-        )
-        json.optString("error").takeIf { it.isNotEmpty() }?.let { error(it) }
+    ): ScanSummary = withContext(Dispatchers.Default) { runLock.withLock {
+            val sink = ProgressSink(
+                { onProgress?.invoke(it) },
+                CleanAudit(context.filesDir, "scan-${mode.id}"),
+            )
+            val json = PythonBridge.scanStreaming(
+                context, mode.id, cleaners, unusedPackages, sink,
+            )
+            json.optString("error").takeIf { it.isNotEmpty() }?.let { error(it) }
 
-        val perCleaner = mutableMapOf<String, Long>()
-        val entries = json.getJSONArray("entries")
-        for (i in 0 until entries.length()) {
-            val e = entries.getJSONObject(i)
-            perCleaner.merge(e.getString("cleaner"), e.getLong("size"), Long::plus)
-        }
+            val perCleaner = mutableMapOf<String, Long>()
+            val entries = json.getJSONArray("entries")
+            for (i in 0 until entries.length()) {
+                val e = entries.getJSONObject(i)
+                perCleaner.merge(e.getString("cleaner"), e.getLong("size"), Long::plus)
+            }
 
-        ScanSummary(
-            totalBytes = json.getLong("total_bytes"),
-            entries = entries.length(),
-            perCleaner = perCleaner,
-            unknownSizeEntries = json.optInt("unknown_size_entries", 0),
-            raw = json,
-        )
-    }
+            ScanSummary(
+                totalBytes = json.getLong("total_bytes"),
+                entries = entries.length(),
+                perCleaner = perCleaner,
+                unknownSizeEntries = json.optInt("unknown_size_entries", 0),
+                raw = json,
+            )
+    }}
 
     suspend fun apply(
         context: Context,
@@ -127,37 +148,37 @@ object CleanerRepository {
         dryRun: Boolean,
         unusedPackages: List<String>? = null,
         onProgress: ((ProgressEvent) -> Unit)? = null,
-    ): CleanSummary = withContext(Dispatchers.Default) {
-        val audit = CleanAudit(
-            context.filesDir,
-            if (dryRun) "dryrun-${mode.id}" else "clean-${mode.id}",
-        )
-        val sink = ProgressSink({ onProgress?.invoke(it) }, audit)
-        val json = PythonBridge.applyCleanStreaming(
-            context, mode.id, cleaners, dryRun, unusedPackages, sink,
-        )
-        json.optString("error").takeIf { it.isNotEmpty() }?.let { error(it) }
+    ): CleanSummary = withContext(Dispatchers.Default) { runLock.withLock {
+            val audit = CleanAudit(
+                context.filesDir,
+                if (dryRun) "dryrun-${mode.id}" else "clean-${mode.id}",
+            )
+            val sink = ProgressSink({ onProgress?.invoke(it) }, audit)
+            val json = PythonBridge.applyCleanStreaming(
+                context, mode.id, cleaners, dryRun, unusedPackages, sink,
+            )
+            json.optString("error").takeIf { it.isNotEmpty() }?.let { error(it) }
 
-        val lines = mutableListOf<String>()
-        val log = json.getJSONArray("log")
-        for (i in 0 until log.length()) {
-            val record = log.getJSONObject(i).toString()
-            lines += record
-            // The structured log carries the per-entry `reason`, which is the
-            // part that actually explains a failed run.
-            audit.write(record)
-        }
+            val lines = mutableListOf<String>()
+            val log = json.getJSONArray("log")
+            for (i in 0 until log.length()) {
+                val record = log.getJSONObject(i).toString()
+                lines += record
+                // The structured log carries the per-entry `reason`, which is the
+                // part that actually explains a failed run.
+                audit.write(record)
+            }
 
-        CleanSummary(
-            dryRun = json.getBoolean("dry_run"),
-            freedBytes = json.getLong("freed_bytes"),
-            deleted = json.getInt("deleted"),
-            failed = json.getInt("failed"),
-            unknown = json.optInt("unknown", 0),
-            logLines = lines,
-            auditPath = audit.path,
-        )
-    }
+            CleanSummary(
+                dryRun = json.getBoolean("dry_run"),
+                freedBytes = json.getLong("freed_bytes"),
+                deleted = json.getInt("deleted"),
+                failed = json.getInt("failed"),
+                unknown = json.optInt("unknown", 0),
+                logLines = lines,
+                auditPath = audit.path,
+            )
+    }}
 
     private fun JSONArray.toStringList(): List<String> =
         (0 until length()).map { getString(it) }

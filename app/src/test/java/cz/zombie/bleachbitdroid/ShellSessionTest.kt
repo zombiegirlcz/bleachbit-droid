@@ -117,4 +117,38 @@ class ShellSessionTest {
             s.close()
         }
     }
+
+    /**
+     * The reader of a shell dropped mid-stream must not leak into the next one.
+     *
+     * This reproduces the corruption found in the 2026-10-28 audit log, where
+     * a progress line named `/davendor.qti.iwlan/cache` -- `/da` plus
+     * `vendor.qti.iwlan/cache`, the middle gone. A flooding command times out,
+     * [ShellSession.close] kills the process, and the old reader thread is
+     * left holding buffered output; it used to append that into the very
+     * StringBuilder the next shell had just been given, splitting the next
+     * command's output around a foreign fragment.
+     */
+    @Test
+    fun `output of a dropped shell never reaches the next command`() {
+        val s = session()
+        try {
+            // Enough output that the reader is certainly mid-stream, and the
+            // text is distinctive so any leak is unmistakable.
+            val flooded = s.exec("yes /data/data/leaked.pkg/cache | head -400000", 1)
+            assertEquals(-1, flooded.code)
+
+            repeat(5) { i ->
+                val r = s.exec("echo clean-$i")
+                assertEquals(0, r.code)
+                assertEquals("clean-$i", r.stdout.trim())
+                assertTrue(
+                    "leaked into command $i: ${r.stdout}",
+                    !r.stdout.contains("leaked.pkg"),
+                )
+            }
+        } finally {
+            s.close()
+        }
+    }
 }

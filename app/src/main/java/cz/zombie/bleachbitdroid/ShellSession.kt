@@ -48,7 +48,31 @@ class ShellSession(
 ) {
     private val execLock = ReentrantLock()
     private val bufLock = Object()
-    private val buffer = StringBuilder()
+
+    /**
+     * One shell generation's output, and only its own.
+     *
+     * Why not the single shared StringBuilder this used to be: [close] kills
+     * the process but cannot stop the reader thread sitting in `read()` with
+     * bytes already in flight. That thread kept appending to the shared
+     * builder while [start] had just cleared it and started a second reader on
+     * the new process -- two threads, one sink. Output arrives in 8192
+     * character chunks, so a path got cut in half and a fragment of the other
+     * shell's output landed between the halves. That is where
+     * `/davendor.qti.iwlan/cache` came from: `/da` + `vendor.qti.iwlan/cache`,
+     * with `ta/data/` lost. Such a path can only ever come back from `rm` as
+     * "no such file or directory" -- a clean reporting failures for files it
+     * never actually named.
+     *
+     * Each generation now gets its own [Pipe]; a reader whose pipe is no
+     * longer the live one drops its data and stops.
+     */
+    private class Pipe {
+        val text = StringBuilder()
+    }
+
+    /** The live generation's pipe; guarded by [bufLock]. */
+    private var pipe = Pipe()
 
     private var process: Process? = null
     private var stdin: OutputStream? = null
@@ -58,7 +82,8 @@ class ShellSession(
         val p = factory()
         process = p
         stdin = p.outputStream
-        synchronized(bufLock) { buffer.setLength(0) }
+        val mine = Pipe()
+        synchronized(bufLock) { pipe = mine }
         val t = Thread {
             val buf = CharArray(8192)
             try {
@@ -66,10 +91,17 @@ class ShellSession(
                     while (true) {
                         val n = reader.read(buf)
                         if (n < 0) break
-                        synchronized(bufLock) {
-                            buffer.append(buf, 0, n)
-                            bufLock.notifyAll()
+                        val superseded = synchronized(bufLock) {
+                            if (pipe !== mine) {
+                                true
+                            } else {
+                                mine.text.append(buf, 0, n)
+                                bufLock.notifyAll()
+                                false
+                            }
                         }
+                        // A dropped shell's leftovers belong to nobody.
+                        if (superseded) break
                     }
                 }
             } catch (_: Throwable) {
@@ -96,6 +128,7 @@ class ShellSession(
             // one.
             try {
                 if (process == null) start()
+                val mine = synchronized(bufLock) { pipe }
                 val id = ++seq
                 val marker = "__BB_END_${id}__"
                 stdin!!.write("{ $command\n} 2>&1; echo \"$marker:\$?\"\n".toByteArray())
@@ -104,7 +137,7 @@ class ShellSession(
                 val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSec)
                 synchronized(bufLock) {
                     while (true) {
-                        val text = buffer.toString()
+                        val text = mine.text.toString()
                         val idx = text.lastIndexOf("$marker:")
                         if (idx >= 0) {
                             val codeStart = idx + marker.length + 1
@@ -113,7 +146,7 @@ class ShellSession(
                                 val code = text.substring(codeStart, nl).trim().toIntOrNull()
                                 if (code != null) {
                                     val out = text.substring(0, idx)
-                                    buffer.delete(0, nl + 1)
+                                    mine.text.delete(0, nl + 1)
                                     return ShellResult(code, out, "")
                                 }
                             }
@@ -146,7 +179,11 @@ class ShellSession(
                 p?.destroyForcibly()
             } catch (_: Throwable) {
             }
-            synchronized(bufLock) { bufLock.notifyAll() }
+            synchronized(bufLock) {
+                // Retiring the pipe is what actually silences the old reader.
+                pipe = Pipe()
+                bufLock.notifyAll()
+            }
         }
     }
 

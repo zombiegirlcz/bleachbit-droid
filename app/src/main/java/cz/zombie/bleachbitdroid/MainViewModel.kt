@@ -274,7 +274,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * A run already in flight must not be joined by a second one.
+     *
+     * Why: the audit logs from 2026-10-28 show a scan, a dry run and a real
+     * clean started 16 and 20 seconds apart -- a root scan takes minutes, so
+     * all three were alive at once, sharing one shell. Taps during a run were
+     * simply not checked here. [CleanerRepository.runLock] is the real
+     * serialization point; this only keeps the user from queueing work they
+     * did not mean to queue, and says so instead of looking ignored.
+     */
+    private fun busy(): Boolean {
+        if (_state.value.phase == Phase.IDLE) return false
+        _state.update { it.copy(message = "Úklid už běží, počkej na dokončení.") }
+        return true
+    }
+
     fun scan() {
+        if (busy()) return
         viewModelScope.launch {
             val current = _state.value
             _state.update {
@@ -305,6 +322,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun clean(dryRun: Boolean) {
+        if (busy()) return
         viewModelScope.launch {
             val current = _state.value
             _state.update {
